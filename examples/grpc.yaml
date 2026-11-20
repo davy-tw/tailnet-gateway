@@ -1,0 +1,34 @@
+# gRPC needs an HTTPS listener: Tailscale Services only negotiate HTTP/2 on
+# HTTPS ports. The certificate comes from Tailscale; the options entry only
+# satisfies the Gateway API rule that a terminating listener names one.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: rpc
+  namespace: tailnet-demo
+spec:
+  gatewayClassName: tailnet
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        options:
+          tailnet-gateway.davy-tw.github.io/certificates: tailscale
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: rpc
+  namespace: tailnet-demo
+spec:
+  parentRefs:
+    - name: rpc
+  hostnames: ["rpc"]
+  rules:
+    - matches:
+        - method: {service: echo.v1.EchoService}
+      backendRefs:
+        - name: echo
+          port: 9000

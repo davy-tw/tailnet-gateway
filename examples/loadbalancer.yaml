@@ -1,0 +1,19 @@
+# Every port becomes a port of one Tailscale Service, svc:db (named after
+# the hostname annotation, or after the Service when it is not set).
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: tailnet-demo
+  annotations:
+    tailnet-gateway.davy-tw.github.io/hostname: db   # also serves port 8080 as HTTP
+spec:
+  type: LoadBalancer
+  loadBalancerClass: tailnet
+  selector: {app: db}
+  ports:
+    - name: admin
+      port: 8080
+      appProtocol: http
+    - name: postgres
+      port: 5432

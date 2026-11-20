@@ -1,0 +1,14 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: tailnet
+spec:
+  controllerName: tailnet-gateway.davy-tw.github.io/gateway-controller
+  description: Exposes Gateways to the tailnet as Tailscale Services.
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: tailnet
+spec:
+  controller: tailnet-gateway.davy-tw.github.io/ingress-controller
