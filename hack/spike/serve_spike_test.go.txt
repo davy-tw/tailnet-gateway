@@ -1,0 +1,303 @@
+package ipnlocal
+
+// Spike for tailnet-gateway: validates that a Tailscale Service web handler
+// can proxy to a non-loopback, DNS-named backend (like <svc>.<ns>.svc), and
+// that gRPC (HTTP/2) works end to end through it.
+//
+// Requires an /etc/hosts entry mapping spikeBackendHost to a non-loopback
+// address of this machine (SPIKE_BACKEND_IP).
+
+import (
+	"context"
+	"crypto/tls"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"os"
+	"strconv"
+	"testing"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/interop"
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	"tailscale.com/ipn"
+	"tailscale.com/tailcfg"
+)
+
+const spikeBackendHost = "echo.demo.svc.cluster.local"
+
+func spikeBackend(t *testing.T) (port string) {
+	ip := os.Getenv("SPIKE_BACKEND_IP")
+	if ip == "" {
+		t.Skip("SPIKE_BACKEND_IP not set")
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := grpc.NewServer()
+	testgrpc.RegisterTestServiceServer(s, interop.NewTestServer())
+	go s.Serve(ln)
+	t.Cleanup(s.Stop)
+	_, port, _ = net.SplitHostPort(ln.Addr().String())
+	return port
+}
+
+// startFront starts a TLS (h2) or plain listener that feeds connections to the
+// real tailscaled serve code path for a Tailscale Service (svc:demo).
+func startFront(t *testing.T, b *LocalBackend, svc tailcfg.ServiceName, useTLS bool) (addr string, port uint16) {
+	front := httptest.NewUnstartedServer(http.HandlerFunc(b.serveWebHandler))
+	addr = front.Listener.Addr().String()
+	_, ps, _ := net.SplitHostPort(addr)
+	p, _ := strconv.ParseUint(ps, 10, 16)
+	port = uint16(p)
+	front.Config.BaseContext = func(net.Listener) context.Context {
+		return serveHTTPContextKey.WithValue(context.Background(), &serveHTTPContext{
+			SrcAddr:       mustAddrPort("100.150.151.152:1234"),
+			ForVIPService: svc,
+			DestPort:      port,
+		})
+	}
+	if useTLS {
+		front.EnableHTTP2 = true // like tailscaled: ALPN h2, http/1.1
+		front.StartTLS()
+	} else {
+		front.Start() // like tailscaled: plain http.Server, no h2c
+	}
+	t.Cleanup(front.Close)
+	return addr, port
+}
+
+func setServiceWeb(t *testing.T, b *LocalBackend, svc tailcfg.ServiceName, port uint16, useTLS bool, proxy string) {
+	suffix := b.currentNode().NetMap().MagicDNSSuffix()
+	hp := ipn.HostPort(net.JoinHostPort(svc.WithoutPrefix()+"."+suffix, strconv.Itoa(int(port))))
+	conf := &ipn.ServeConfig{
+		Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+			svc: {
+				TCP: map[uint16]*ipn.TCPPortHandler{port: {HTTPS: useTLS, HTTP: !useTLS}},
+				Web: map[ipn.HostPort]*ipn.WebServerConfig{
+					hp: {Handlers: map[string]*ipn.HTTPHandler{"/": {Proxy: proxy}}},
+				},
+			},
+		},
+	}
+	if err := b.SetServeConfig(conf, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runInterop(t *testing.T, cc *grpc.ClientConn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	tc := testgrpc.NewTestServiceClient(cc)
+	interop.DoEmptyUnaryCall(ctx, tc)
+	t.Log("unary: ok")
+	interop.DoLargeUnaryCall(ctx, tc)
+	t.Log("large unary: ok")
+	interop.DoClientStreaming(ctx, tc)
+	t.Log("client streaming: ok")
+	interop.DoServerStreaming(ctx, tc)
+	t.Log("server streaming: ok")
+	interop.DoPingPong(ctx, tc)
+	t.Log("bidi ping-pong: ok")
+	interop.DoCustomMetadata(ctx, tc)
+	t.Log("custom metadata + trailers: ok")
+	interop.DoStatusCodeAndMessage(ctx, tc)
+	t.Log("status code/message: ok")
+}
+
+// Risk 1 + 2: HTTPS service port, proxy target http://<dns name>:<port>, gRPC.
+func TestSpikeGRPCOverHTTPSServiceToDNSBackend(t *testing.T) {
+	bport := spikeBackend(t)
+	b := newTestBackend(t)
+	const svc = tailcfg.ServiceName("svc:demo")
+	addr, port := startFront(t, b, svc, true)
+	setServiceWeb(t, b, svc, port, true, "http://"+spikeBackendHost+":"+bport)
+
+	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+		InsecureSkipVerify: true, ServerName: "demo.ts.net",
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+	runInterop(t, cc)
+}
+
+// gRPC to a plain HTTP service port (h2c from the client): expected to fail,
+// because tailscaled's plain HTTP server does not accept h2c.
+func TestSpikeGRPCOverPlainHTTPService(t *testing.T) {
+	bport := spikeBackend(t)
+	b := newTestBackend(t)
+	const svc = tailcfg.ServiceName("svc:demo")
+	addr, port := startFront(t, b, svc, false)
+	setServiceWeb(t, b, svc, port, false, "http://"+spikeBackendHost+":"+bport)
+
+	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = testgrpc.NewTestServiceClient(cc).EmptyCall(ctx, &testgrpc.Empty{})
+	t.Logf("plain-HTTP service port + gRPC: err=%v", err)
+	if err == nil {
+		t.Log("UNEXPECTED: h2c accepted")
+	}
+}
+
+// HTTP/1.1 proxying to a DNS-named, non-loopback backend.
+func TestSpikeHTTP1ToDNSBackend(t *testing.T) {
+	ip := os.Getenv("SPIKE_BACKEND_IP")
+	if ip == "" {
+		t.Skip()
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotPath, gotHost string
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotHost = r.URL.Path, r.Host
+		w.Write([]byte("hello from backend"))
+	})}
+	go srv.Serve(ln)
+	defer srv.Close()
+	_, bport, _ := net.SplitHostPort(ln.Addr().String())
+
+	b := newTestBackend(t)
+	const svc = tailcfg.ServiceName("svc:demo")
+	addr, port := startFront(t, b, svc, false)
+	setServiceWeb(t, b, svc, port, false, "http://"+spikeBackendHost+":"+bport)
+
+	res, err := http.Get("http://" + addr + "/api/v1/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("status %d", res.StatusCode)
+	}
+	t.Logf("HTTP/1.1 via svc to %s: status=%d backendPath=%s backendHost=%s", spikeBackendHost, res.StatusCode, gotPath, gotHost)
+}
+
+// Raw TCP forward (TCPRoute / TLS passthrough) to a DNS-named backend,
+// carrying plaintext gRPC.
+func TestSpikeTCPForwardToDNSBackend(t *testing.T) {
+	bport := spikeBackend(t)
+	b := newTestBackend(t)
+	const svc = tailcfg.ServiceName("svc:db")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	_, ps, _ := net.SplitHostPort(ln.Addr().String())
+	p, _ := strconv.ParseUint(ps, 10, 16)
+	tcph := &ipn.TCPPortHandler{TCPForward: net.JoinHostPort(spikeBackendHost, bport)}
+	if err := b.SetServeConfig(&ipn.ServeConfig{Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+		svc: {TCP: map[uint16]*ipn.TCPPortHandler{uint16(p): tcph}},
+	}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	h := b.tcpHandlerForServeTCP(tcph.View(), uint16(p), mustAddrPort("100.150.151.152:1234"), &serveHTTPContext{ForVIPService: svc, DestPort: uint16(p)}, svc)
+	if h == nil {
+		t.Fatal("no handler")
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go h(c)
+		}
+	}()
+	cc, err := grpc.NewClient(ln.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+	runInterop(t, cc)
+}
+
+func mustAddrPort(s string) netip.AddrPort { return netip.MustParseAddrPort(s) }
+
+// gRPC to a TLS backend (BackendTLSPolicy case): https+insecure target.
+func TestSpikeGRPCToTLSBackend(t *testing.T) {
+	ip := os.Getenv("SPIKE_BACKEND_IP")
+	if ip == "" {
+		t.Skip()
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := httptest.NewUnstartedServer(nil)
+	hs.StartTLS()
+	tlsCert := hs.TLS.Certificates[0]
+	hs.Close()
+	s := grpc.NewServer(grpc.Creds(credentials.NewServerTLSFromCert(&tlsCert)))
+	testgrpc.RegisterTestServiceServer(s, interop.NewTestServer())
+	go s.Serve(ln)
+	defer s.Stop()
+	_, bport, _ := net.SplitHostPort(ln.Addr().String())
+
+	b := newTestBackend(t)
+	const svc = tailcfg.ServiceName("svc:demo")
+	addr, port := startFront(t, b, svc, true)
+	setServiceWeb(t, b, svc, port, true, "https+insecure://"+spikeBackendHost+":"+bport)
+	cc, err := grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{InsecureSkipVerify: true, ServerName: "demo.ts.net"})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+	runInterop(t, cc)
+}
+
+// Path prefix mounts: proxy URL carries the mount path so that the backend
+// sees the original request path (no rewrite), as Gateway API expects.
+func TestSpikePathPrefixMount(t *testing.T) {
+	ip := os.Getenv("SPIKE_BACKEND_IP")
+	if ip == "" {
+		t.Skip()
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotPath string
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { gotPath = r.URL.Path })}
+	go srv.Serve(ln)
+	defer srv.Close()
+	_, bport, _ := net.SplitHostPort(ln.Addr().String())
+	b := newTestBackend(t)
+	const svc = tailcfg.ServiceName("svc:demo")
+	addr, port := startFront(t, b, svc, false)
+	suffix := b.currentNode().NetMap().MagicDNSSuffix()
+	hp := ipn.HostPort(net.JoinHostPort("demo."+suffix, strconv.Itoa(int(port))))
+	base := "http://" + spikeBackendHost + ":" + bport
+	if err := b.SetServeConfig(&ipn.ServeConfig{Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{svc: {
+		TCP: map[uint16]*ipn.TCPPortHandler{port: {HTTP: true}},
+		Web: map[ipn.HostPort]*ipn.WebServerConfig{hp: {Handlers: map[string]*ipn.HTTPHandler{
+			"/":    {Proxy: base + "/"},
+			"/api": {Proxy: base + "/api"},
+		}}},
+	}}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"/api", "/api/", "/api/v1/x", "/apix", "/", "/other/y"} {
+		gotPath = ""
+		res, err := http.Get("http://" + addr + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		t.Logf("request %-10s -> backend path %q (status %d)", p, gotPath, res.StatusCode)
+	}
+}
