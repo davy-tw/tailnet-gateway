@@ -86,19 +86,30 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.Get(ctx, req.NamespacedName, gw); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	gc, err := r.managedClass(ctx, string(gw.Spec.GatewayClassName))
+	gc, classExists, err := r.lookupClass(ctx, string(gw.Spec.GatewayClassName))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if !gw.DeletionTimestamp.IsZero() || gc == nil {
+	deleting := !gw.DeletionTimestamp.IsZero()
+	if gc == nil || deleting {
 		if !controllerutil.ContainsFinalizer(gw, config.Finalizer) {
 			return ctrl.Result{}, nil
 		}
-		if err := r.finalize(ctx, gw, gc == nil && gw.DeletionTimestamp.IsZero()); err != nil {
-			return ctrl.Result{}, err
+		if !deleting && !classExists {
+			// The class is gone, perhaps only for a moment (a reinstall,
+			// or a GitOps tool recreating it). Stop serving but keep the
+			// devices and state, as for an invalid class.
+			return ctrl.Result{}, errors.Join(r.withdraw(ctx, gw), r.writeClassMissingStatus(ctx, gw))
+		}
+		// The Gateway is being deleted, or now belongs to another
+		// controller's class.
+		done, err := r.finalize(ctx, gw, !deleting)
+		if err != nil || !done {
+			return ctrl.Result{RequeueAfter: pendingRequeue}, err
 		}
 		orig := gw.DeepCopy()
 		controllerutil.RemoveFinalizer(gw, config.Finalizer)
+		delete(gw.Annotations, config.AnnotationDevices)
 		return ctrl.Result{}, client.IgnoreNotFound(r.Patch(ctx, gw, client.MergeFrom(orig)))
 	}
 	if !controllerutil.ContainsFinalizer(gw, config.Finalizer) {
@@ -140,6 +151,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	statusErr := errors.Join(
 		r.writeRouteStatus(ctx, gw, routes, res),
 		r.writePolicyStatus(ctx, gw, res),
+		r.recordDevices(ctx, gw),
 	)
 
 	var progErr error
@@ -177,7 +189,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	switch {
 	case ip != nil || !res.Accepted:
 		return ctrl.Result{}, nil // a spec or class change will trigger the next reconcile
-	case !programmed || res.WebPending:
+	case !programmed || res.WebPending || pe != nil:
 		return ctrl.Result{RequeueAfter: pendingRequeue}, nil
 	case ready < desired:
 		return ctrl.Result{RequeueAfter: degradedRequeue}, nil
@@ -322,7 +334,7 @@ func (r *GatewayReconciler) claimedServices(ctx context.Context, gw *gwv1.Gatewa
 			}
 			return nil, err
 		}
-		if other.UID != owner.UID || !olderGateway(other, gw) {
+		if other.UID != owner.UID || !olderGateway(other, gw) || !r.isServeConfig(ctx, cm, other) {
 			continue
 		}
 		labels := strings.Split(cm.Annotations[config.AnnotationTailscaleServices], ",")
@@ -337,6 +349,25 @@ func (r *GatewayReconciler) claimedServices(ctx context.Context, gw *gwv1.Gatewa
 		}
 	}
 	return claimed, nil
+}
+
+// isServeConfig reports whether cm is the serve config this controller
+// wrote for gw: named after it, of a class this controller serves, and
+// applied by this controller. Anyone who may create ConfigMaps can copy
+// the labels and owner reference, and must not reserve names that way.
+func (r *GatewayReconciler) isServeConfig(ctx context.Context, cm *corev1.ConfigMap, gw *gwv1.Gateway) bool {
+	if cm.Name != gw.Name {
+		return false
+	}
+	if gc, err := r.managedClass(ctx, string(gw.Spec.GatewayClassName)); err != nil || gc == nil {
+		return false
+	}
+	for _, f := range cm.ManagedFields {
+		if f.Manager == FieldOwner && f.Operation == metav1.ManagedFieldsOperationApply {
+			return true
+		}
+	}
+	return false
 }
 
 // olderGateway orders Gateways by creation time, then by namespace/name.
@@ -520,8 +551,9 @@ func (r *GatewayReconciler) authKey(ctx context.Context, gw *gwv1.Gateway, param
 		}
 		return key, nil
 	}
+	// Read directly: only the controller's own Secrets are cached.
 	user := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, user); err != nil {
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: gw.Name}, user); err != nil {
 		if apierrors.IsNotFound(err) {
 			return "", &pendingError{fmt.Sprintf("no auth key: create Secret %s/%s with an %q (a reusable, ephemeral, pre-authorized, tagged key), or configure an OAuth client", gw.Namespace, gw.Name, proxy.KeyAuthKey)}
 		}
@@ -540,7 +572,13 @@ func (r *GatewayReconciler) ensureStateSecrets(ctx context.Context, gw *gwv1.Gat
 	for i := 0; i < int(params.Replicas); i++ {
 		name := proxy.StateSecretName(gw.Name, i)
 		sec := &corev1.Secret{}
-		err := r.Get(ctx, types.NamespacedName{Namespace: gw.Namespace, Name: name}, sec)
+		nn := types.NamespacedName{Namespace: gw.Namespace, Name: name}
+		err := r.Get(ctx, nn, sec)
+		if apierrors.IsNotFound(err) {
+			// The cache only holds Secrets labelled as this controller's:
+			// check that no other Secret has the name before minting a key.
+			err = r.reader().Get(ctx, nn, sec)
+		}
 		switch {
 		case apierrors.IsNotFound(err):
 			key, err := r.authKey(ctx, gw, params)
@@ -613,8 +651,14 @@ func (r *GatewayReconciler) checkDevice(ctx context.Context, gw *gwv1.Gateway, p
 	}
 	id := string(sec.Data[proxy.KeyDeviceID])
 	exists, err := r.TS.DeviceExists(ctx, id)
-	if err != nil || exists {
-		return err
+	if err != nil {
+		// Only a recovery check: a failure (such as an OAuth client
+		// without device read access) must not stop provisioning.
+		log.FromContext(ctx).Info("could not check whether the device of an unready replica exists", "replica", i, "device", id, "error", err.Error())
+		return nil
+	}
+	if exists {
+		return nil
 	}
 	log.FromContext(ctx).Info("device of replica no longer exists; resetting its state", "replica", i, "device", id)
 	key, err := r.authKey(ctx, gw, params)
@@ -626,6 +670,9 @@ func (r *GatewayReconciler) checkDevice(ctx context.Context, gw *gwv1.Gateway, p
 		return err
 	}
 	r.event(gw, corev1.EventTypeNormal, "DeviceReset", "replica %d's device %s was removed from the tailnet; re-registering", i, id)
+	if err := r.forgetDevices(ctx, gw, id); err != nil {
+		return err
+	}
 	return client.IgnoreNotFound(r.Delete(ctx, pod))
 }
 
@@ -649,7 +696,10 @@ func (r *GatewayReconciler) pruneStateSecrets(ctx context.Context, gw *gwv1.Gate
 		} else if !apierrors.IsNotFound(err) {
 			return err
 		}
-		if err := r.deleteDevice(ctx, gw, s); err != nil {
+		if err := r.deleteDevice(ctx, gw, string(s.Data[proxy.KeyDeviceID])); err != nil {
+			return err
+		}
+		if err := r.forgetDevices(ctx, gw, string(s.Data[proxy.KeyDeviceID])); err != nil {
 			return err
 		}
 		if err := r.Delete(ctx, s); client.IgnoreNotFound(err) != nil {
@@ -659,13 +709,12 @@ func (r *GatewayReconciler) pruneStateSecrets(ctx context.Context, gw *gwv1.Gate
 	return nil
 }
 
-func (r *GatewayReconciler) deleteDevice(ctx context.Context, gw *gwv1.Gateway, s *corev1.Secret) error {
-	id := string(s.Data[proxy.KeyDeviceID])
+func (r *GatewayReconciler) deleteDevice(ctx context.Context, gw *gwv1.Gateway, id string) error {
 	if id == "" {
 		return nil
 	}
 	if r.TS == nil {
-		log.FromContext(ctx).Info("manual key mode: not deleting device; ephemeral devices expire on their own", "device", id, "secret", s.Name)
+		log.FromContext(ctx).Info("manual key mode: not deleting device; ephemeral devices expire on their own", "device", id, "gateway", gw.Name)
 		return nil
 	}
 	if err := r.TS.DeleteDevice(ctx, id); err != nil {
@@ -674,46 +723,161 @@ func (r *GatewayReconciler) deleteDevice(ctx context.Context, gw *gwv1.Gateway, 
 	return nil
 }
 
-// finalize deletes the Gateway's devices. When the Gateway merely stopped
-// being managed (unmanage), it also removes the data plane and statuses.
-func (r *GatewayReconciler) finalize(ctx context.Context, gw *gwv1.Gateway, unmanage bool) error {
+// finalize cleans up a Gateway that is being deleted, or that stopped
+// being managed (unmanage). The proxy StatefulSet goes first, and the
+// devices are deleted only once its pods are gone, so that the replicas
+// drain while their devices still serve. It reports whether cleanup is
+// done; until then the caller requeues.
+func (r *GatewayReconciler) finalize(ctx context.Context, gw *gwv1.Gateway, unmanage bool) (bool, error) {
 	secrets, err := r.stateSecrets(ctx, gw)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if r.TS == nil && len(secrets) > 0 {
+	if err := r.withdraw(ctx, gw); err != nil {
+		return false, err
+	}
+	if running, err := r.proxyPodsRunning(ctx, gw); err != nil || running {
+		return false, err
+	}
+	// Device IDs come from the state Secrets and from the Gateway's
+	// annotation, which outlives the Secrets under foreground deletion.
+	ids := recordedDevices(gw)
+	for _, s := range secrets {
+		ids = addDevice(ids, string(s.Data[proxy.KeyDeviceID]))
+	}
+	if r.TS == nil && len(ids) > 0 {
 		r.event(gw, corev1.EventTypeWarning, "DevicesNotDeleted", "no OAuth client configured: devices are not deleted (ephemeral devices expire on their own)")
 	}
-	for i := range secrets {
-		if err := r.deleteDevice(ctx, gw, &secrets[i]); err != nil {
-			return err
+	for _, id := range ids {
+		if err := r.deleteDevice(ctx, gw, id); err != nil {
+			return false, err
 		}
 	}
 	routes, err := r.listRoutes(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := r.writeRouteStatus(ctx, gw, routes, &translate.Result{}); err != nil {
-		return err
+		return false, err
 	}
 	if err := r.writePolicyStatus(ctx, gw, &translate.Result{}); err != nil {
-		return err
+		return false, err
 	}
 	if !unmanage {
-		return nil // owner references garbage-collect the rest
+		return true, nil // owner references garbage-collect the rest
 	}
-	for _, o := range []client.Object{&appsv1.StatefulSet{}, &policyv1.PodDisruptionBudget{}, &corev1.ConfigMap{},
+	for _, o := range []client.Object{&policyv1.PodDisruptionBudget{}, &corev1.ConfigMap{},
 		&rbacv1.RoleBinding{}, &rbacv1.Role{}, &corev1.ServiceAccount{}} {
 		if err := r.deleteOwned(ctx, gw, o, gw.Name); err != nil {
-			return err
+			return false, err
 		}
 	}
 	for i := range secrets {
 		if err := r.Delete(ctx, &secrets[i]); client.IgnoreNotFound(err) != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return true, nil
+}
+
+// proxyPodsRunning reports whether any pod of the Gateway's proxy
+// StatefulSet still exists.
+func (r *GatewayReconciler) proxyPodsRunning(ctx context.Context, gw *gwv1.Gateway) (bool, error) {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(gw.Namespace), client.MatchingLabels(proxy.SelectorLabels(gw.Name))); err != nil {
+		return false, err
+	}
+	for i := range pods.Items {
+		if o := metav1.GetControllerOf(&pods.Items[i]); o != nil && o.Kind == "StatefulSet" && o.Name == gw.Name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// recordedDevices returns the device IDs in the Gateway's annotation.
+func recordedDevices(gw *gwv1.Gateway) []string {
+	var ids []string
+	for _, id := range strings.Split(gw.Annotations[config.AnnotationDevices], ",") {
+		ids = addDevice(ids, strings.TrimSpace(id))
+	}
+	return ids
+}
+
+func addDevice(ids []string, id string) []string {
+	if id == "" {
+		return ids
+	}
+	for _, x := range ids {
+		if x == id {
+			return ids
+		}
+	}
+	ids = append(ids, id)
+	sort.Strings(ids)
+	return ids
+}
+
+// recordDevices adds the device IDs found in the state Secrets to the
+// Gateway's annotation.
+func (r *GatewayReconciler) recordDevices(ctx context.Context, gw *gwv1.Gateway) error {
+	secrets, err := r.stateSecrets(ctx, gw)
+	if err != nil {
+		return err
+	}
+	ids := recordedDevices(gw)
+	for _, s := range secrets {
+		ids = addDevice(ids, string(s.Data[proxy.KeyDeviceID]))
+	}
+	return r.setRecordedDevices(ctx, gw, ids)
+}
+
+// forgetDevices removes device IDs that no longer need deleting.
+func (r *GatewayReconciler) forgetDevices(ctx context.Context, gw *gwv1.Gateway, forget ...string) error {
+	var ids []string
+	for _, id := range recordedDevices(gw) {
+		keep := true
+		for _, f := range forget {
+			keep = keep && id != f
+		}
+		if keep {
+			ids = append(ids, id)
+		}
+	}
+	return r.setRecordedDevices(ctx, gw, ids)
+}
+
+func (r *GatewayReconciler) setRecordedDevices(ctx context.Context, gw *gwv1.Gateway, ids []string) error {
+	value := strings.Join(ids, ",")
+	if gw.Annotations[config.AnnotationDevices] == value {
+		return nil
+	}
+	orig := gw.DeepCopy()
+	if value == "" {
+		delete(gw.Annotations, config.AnnotationDevices)
+	} else {
+		if gw.Annotations == nil {
+			gw.Annotations = map[string]string{}
+		}
+		gw.Annotations[config.AnnotationDevices] = value
+	}
+	return r.Patch(ctx, gw, client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{}))
+}
+
+// writeClassMissingStatus marks a Gateway whose GatewayClass no longer
+// exists as not accepted and not programmed.
+func (r *GatewayReconciler) writeClassMissingStatus(ctx context.Context, gw *gwv1.Gateway) error {
+	orig := gw.DeepCopy()
+	msg := fmt.Sprintf("GatewayClass %q not found; the proxy is stopped and its devices are kept until the class is back", gw.Spec.GatewayClassName)
+	for _, t := range []gwv1.GatewayConditionType{gwv1.GatewayConditionAccepted, gwv1.GatewayConditionProgrammed} {
+		meta.SetStatusCondition(&gw.Status.Conditions, metav1.Condition{Type: string(t), Status: metav1.ConditionFalse,
+			Reason: string(gwv1.GatewayReasonPending), Message: msg, ObservedGeneration: gw.Generation})
+	}
+	gw.Status.Addresses = nil
+	if gatewayStatusEqual(&orig.Status, &gw.Status) {
+		return nil
+	}
+	return client.IgnoreNotFound(r.Status().Patch(ctx, gw, client.MergeFrom(orig)))
 }
 
 // ---- Gateway status ----
@@ -742,16 +906,23 @@ func (r *GatewayReconciler) writeGatewayStatus(ctx context.Context, gw *gwv1.Gat
 	case ip != nil || !res.Accepted:
 		programmed.Reason = string(gwv1.GatewayReasonInvalid)
 		programmed.Message = progErr.Error()
-	case progErr != nil:
+	case progErr != nil && ready == 0:
 		programmed.Message = fmt.Sprintf("%v (%s)", progErr, counts)
 	case ready == 0:
 		programmed.Message = "waiting for a proxy replica to become ready (" + counts + ")"
 	case res.WebPending:
 		programmed.Message = "waiting to learn the tailnet domain from a proxy replica (" + counts + ")"
 	default:
+		// Ready replicas keep serving through a failed step (a key that
+		// could not be minted while scaling up, an API rate limit), so the
+		// Gateway stays programmed and keeps its addresses; the error is
+		// reported in the message.
 		programmed.Status = metav1.ConditionTrue
 		programmed.Reason = string(gwv1.GatewayReasonProgrammed)
 		programmed.Message = counts
+		if progErr != nil {
+			programmed.Message = fmt.Sprintf("%s; last update failed: %v", counts, progErr)
+		}
 	}
 	meta.SetStatusCondition(&st.Conditions, programmed)
 
@@ -1135,12 +1306,6 @@ func (r *GatewayReconciler) gatewaysForRoute(ctx context.Context, obj client.Obj
 	return out
 }
 
-// gatewayForUserSecret maps a user's auth Secret to the Gateway of the same
-// name.
-func (r *GatewayReconciler) gatewayForUserSecret(_ context.Context, obj client.Object) []reconcile.Request {
-	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}}}
-}
-
 // SetupWithManager registers the reconciler and its watches.
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.APIReader = mgr.GetAPIReader()
@@ -1159,10 +1324,6 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Secret{}).
 		Watches(&gwv1.GatewayClass{}, handler.EnqueueRequestsFromMapFunc(r.gatewaysForClass)).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.gatewaysForParamsConfigMap)).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.gatewayForUserSecret),
-			builder.WithPredicates(predicate.NewPredicateFuncs(func(o client.Object) bool {
-				return o.GetLabels()[proxy.LabelManagedBy] != proxy.ManagedBy
-			}))).
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.allGateways), builder.WithPredicates(createDelete)).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.allGateways), builder.WithPredicates(predicate.LabelChangedPredicate{})).
 		Watches(&gwv1.HTTPRoute{}, routeHandler)

@@ -43,12 +43,26 @@ func (r *IngressReconciler) warn(obj runtime.Object, reason, msg string, args ..
 	}
 }
 
+// annotationLegacyIngressClass is the deprecated way to pick a class. The
+// API server does not default spec.ingressClassName for Ingresses that set
+// it.
+const annotationLegacyIngressClass = "kubernetes.io/ingress.class"
+
 // managed reports whether the Ingress belongs to this controller: its
 // class (named, or the cluster default when none is named) is the
-// configured IngressClass, and that class names this controller.
+// configured IngressClass, and that class names this controller. An
+// Ingress without spec.ingressClassName that names a class through the
+// legacy annotation belongs to that class, never to the default one.
 func (r *IngressReconciler) managed(ctx context.Context, ing *networkingv1.Ingress) (bool, error) {
-	if ing.Spec.IngressClassName != nil && *ing.Spec.IngressClassName != r.Config.IngressClass {
+	named := ing.Spec.IngressClassName != nil
+	if named && *ing.Spec.IngressClassName != r.Config.IngressClass {
 		return false, nil
+	}
+	if legacy, ok := ing.Annotations[annotationLegacyIngressClass]; !named && ok {
+		if legacy != r.Config.IngressClass {
+			return false, nil
+		}
+		named = true
 	}
 	ic := &networkingv1.IngressClass{}
 	if err := r.Get(ctx, types.NamespacedName{Name: r.Config.IngressClass}, ic); err != nil {
@@ -57,7 +71,7 @@ func (r *IngressReconciler) managed(ctx context.Context, ing *networkingv1.Ingre
 	if ic.Spec.Controller != config.IngressControllerName {
 		return false, nil
 	}
-	return ing.Spec.IngressClassName != nil || ic.Annotations[annotationDefaultIngressClass] == "true", nil
+	return named || ic.Annotations[annotationDefaultIngressClass] == "true", nil
 }
 
 // Reconcile implements reconcile.Reconciler.

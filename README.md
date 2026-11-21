@@ -131,8 +131,11 @@ and one state Secret `N-<i>` per replica.
   `kubectl drain` moves replicas one at a time without dropping traffic.
 - Replicas are spread across nodes (soft anti-affinity) and zones.
 - Scaling down deletes the removed replicas' state Secrets and devices once
-  their pods are gone.
-  Deleting the Gateway deletes all its devices (OAuth mode).
+  their pods are gone. Deleting the Gateway stops its pods first and then
+  deletes all its devices (OAuth mode), also under foreground deletion.
+- Devices are only deleted with their Gateway. A GatewayClass in use keeps
+  the standard `gateway-exists-finalizer`; if it disappears anyway, its
+  Gateways stop serving and keep their devices until it is back.
 - In OAuth mode, a replica whose device has disappeared from the tailnet (an
   ephemeral device that stayed offline too long) is reset and re-registered.
 

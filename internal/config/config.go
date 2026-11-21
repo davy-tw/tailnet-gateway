@@ -36,6 +36,12 @@ const (
 	// not in the config yet (see the Gateway reconciler's claims).
 	AnnotationTailscaleServices = Domain + "/tailscale-services"
 
+	// AnnotationDevices on a Gateway lists the tailnet device IDs of its
+	// replicas, so that they can be deleted with the Gateway even after
+	// garbage collection has removed the state Secrets (foreground
+	// deletion).
+	AnnotationDevices = Domain + "/devices"
+
 	LabelSourceKind = Domain + "/source-kind"
 	LabelSourceName = Domain + "/source-name"
 

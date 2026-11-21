@@ -11,9 +11,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -41,17 +44,24 @@ func (r *classResolver) reader() client.Reader {
 
 // managedClass returns the GatewayClass if this controller serves it.
 func (r *classResolver) managedClass(ctx context.Context, name string) (*gwv1.GatewayClass, error) {
+	gc, _, err := r.lookupClass(ctx, name)
+	return gc, err
+}
+
+// lookupClass returns the GatewayClass if this controller serves it, and
+// whether a class of that name exists at all.
+func (r *classResolver) lookupClass(ctx context.Context, name string) (*gwv1.GatewayClass, bool, error) {
 	gc := &gwv1.GatewayClass{}
 	if err := r.Get(ctx, types.NamespacedName{Name: name}, gc); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, nil
+			return nil, false, nil
 		}
-		return nil, err
+		return nil, false, err
 	}
 	if string(gc.Spec.ControllerName) != r.Config.ControllerName {
-		return nil, nil
+		return nil, true, nil
 	}
-	return gc, nil
+	return gc, true, nil
 }
 
 // invalidParamsError marks a GatewayClass whose parameters are unusable.
@@ -104,6 +114,12 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err != nil || gc == nil {
 		return ctrl.Result{}, err
 	}
+	if err := r.syncFinalizer(ctx, gc); err != nil {
+		return ctrl.Result{}, err
+	}
+	if !gc.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
 	_, unknown, perr := r.classParams(ctx, gc)
 	var ip *invalidParamsError
 	cond := metav1.Condition{
@@ -135,6 +151,59 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{}, r.Status().Patch(ctx, gc, client.MergeFrom(orig))
+}
+
+// syncFinalizer keeps the standard gateway-exists finalizer on a class
+// while Gateways use it, so that the class cannot be deleted out from under
+// them.
+func (r *GatewayClassReconciler) syncFinalizer(ctx context.Context, gc *gwv1.GatewayClass) error {
+	var list gwv1.GatewayList
+	if err := r.List(ctx, &list); err != nil {
+		return err
+	}
+	inUse := false
+	for _, gw := range list.Items {
+		if string(gw.Spec.GatewayClassName) == gc.Name {
+			inUse = true
+			break
+		}
+	}
+	has := controllerutil.ContainsFinalizer(gc, gwv1.GatewayClassFinalizerGatewaysExist)
+	if inUse == has || inUse && !gc.DeletionTimestamp.IsZero() {
+		return nil
+	}
+	orig := gc.DeepCopy()
+	if inUse {
+		controllerutil.AddFinalizer(gc, gwv1.GatewayClassFinalizerGatewaysExist)
+	} else {
+		controllerutil.RemoveFinalizer(gc, gwv1.GatewayClassFinalizerGatewaysExist)
+	}
+	return client.IgnoreNotFound(r.Patch(ctx, gc, client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})))
+}
+
+// gatewayClassUsers enqueues the class of a Gateway that is created or
+// deleted, and both classes when a Gateway changes class.
+func gatewayClassUsers() handler.EventHandler {
+	add := func(q workqueue.TypedRateLimitingInterface[reconcile.Request], obj client.Object) {
+		if gw, ok := obj.(*gwv1.Gateway); ok {
+			q.Add(reconcile.Request{NamespacedName: types.NamespacedName{Name: string(gw.Spec.GatewayClassName)}})
+		}
+	}
+	return handler.Funcs{
+		CreateFunc: func(_ context.Context, e event.CreateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			add(q, e.Object)
+		},
+		UpdateFunc: func(_ context.Context, e event.UpdateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			o, n := e.ObjectOld.(*gwv1.Gateway), e.ObjectNew.(*gwv1.Gateway)
+			if o.Spec.GatewayClassName != n.Spec.GatewayClassName {
+				add(q, o)
+				add(q, n)
+			}
+		},
+		DeleteFunc: func(_ context.Context, e event.DeleteEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+			add(q, e.Object)
+		},
+	}
 }
 
 func asInvalid(err error, target **invalidParamsError) bool {
@@ -188,5 +257,6 @@ func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return ok && string(gc.Spec.ControllerName) == r.Config.ControllerName
 		}))).
 		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(classesForConfigMap(r.Client, r.Config.ControllerName))).
+		Watches(&gwv1.Gateway{}, gatewayClassUsers()).
 		Complete(r)
 }

@@ -9,15 +9,11 @@ import (
 	"os"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	policyv1 "k8s.io/api/policy/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -96,11 +92,8 @@ func main() {
 		LeaderElection:          true,
 		LeaderElectionID:        "tailnet-gateway-controller",
 		LeaderElectionNamespace: cfg.Namespace,
-		// Objects that are only read occasionally are fetched directly
-		// instead of caching every one in the cluster.
-		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{
-			&corev1.Pod{}, &corev1.ServiceAccount{}, &rbacv1.Role{}, &rbacv1.RoleBinding{}, &policyv1.PodDisruptionBudget{},
-		}}},
+		Client:                  controller.ClientOptions(),
+		Cache:                   controller.CacheOptions(),
 	})
 	if err != nil {
 		setupLog.Error(err, "creating manager")

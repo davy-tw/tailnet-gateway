@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -139,9 +140,7 @@ func startEnv(t *testing.T, withManager bool) *env {
 	ts := &fakeTS{devices: map[string]bool{}}
 	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{Scheme: scheme, Metrics: metricsserver.Options{BindAddress: "0"},
 		Controller: ctrlconfig.Controller{SkipNameValidation: ptr.To(true)},
-		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{
-			&corev1.Pod{}, &corev1.ServiceAccount{}, &rbacv1.Role{}, &rbacv1.RoleBinding{}, &policyv1.PodDisruptionBudget{},
-		}}}})
+		Client:     ClientOptions(), Cache: CacheOptions()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -807,5 +806,146 @@ func TestEnvtestOwnership(t *testing.T) {
 	e.create(&gwv1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "late"}, Spec: gwv1.GatewayClassSpec{ControllerName: gwv1.GatewayController(config.DefaultControllerName)}})
 	e.eventually("service exposed once its class exists", func() error {
 		return e.get("two", "late", &gwv1.Gateway{})
+	})
+}
+
+func TestEnvtestDeletionSafety(t *testing.T) {
+	e := startEnv(t, true)
+	class := func() *gwv1.GatewayClass {
+		return &gwv1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "tailnet"}, Spec: gwv1.GatewayClassSpec{ControllerName: gwv1.GatewayController(config.DefaultControllerName)}}
+	}
+	e.create(namespace("d"), class())
+	e.create(httpGateway("d", "gw"))
+
+	e.eventually("class protected while in use", func() error {
+		gc := &gwv1.GatewayClass{}
+		if err := e.get("", "tailnet", gc); err != nil {
+			return err
+		}
+		if !slices.Contains(gc.Finalizers, gwv1.GatewayClassFinalizerGatewaysExist) {
+			return fmt.Errorf("finalizers = %v", gc.Finalizers)
+		}
+		return nil
+	})
+	e.eventually("state secrets", func() error {
+		for i := 0; i < 2; i++ {
+			if err := e.get("d", proxy.StateSecretName("gw", i), &corev1.Secret{}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	for i := 0; i < 2; i++ {
+		s := &corev1.Secret{}
+		_ = e.get("d", proxy.StateSecretName("gw", i), s)
+		s.Data["device_id"] = []byte(fmt.Sprintf("dev%d", i))
+		if err := e.c.Update(e.ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.eventually("devices recorded on the Gateway", func() error {
+		g := &gwv1.Gateway{}
+		if err := e.get("d", "gw", g); err != nil {
+			return err
+		}
+		if got := g.Annotations[config.AnnotationDevices]; got != "dev0,dev1" {
+			return fmt.Errorf("annotation = %q", got)
+		}
+		return nil
+	})
+
+	// The class disappears (say, a reinstall that forces it away): the
+	// Gateway stops serving but keeps its devices and state.
+	gc := &gwv1.GatewayClass{}
+	_ = e.get("", "tailnet", gc)
+	gc.Finalizers = nil
+	if err := e.c.Update(e.ctx, gc); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.c.Delete(e.ctx, gc); err != nil {
+		t.Fatal(err)
+	}
+	e.eventually("gateway withdrawn", func() error {
+		g := &gwv1.Gateway{}
+		if err := e.get("d", "gw", g); err != nil {
+			return err
+		}
+		c := meta.FindStatusCondition(g.Status.Conditions, "Accepted")
+		if c == nil || c.Status != metav1.ConditionFalse || c.Reason != "Pending" {
+			return fmt.Errorf("accepted = %+v", c)
+		}
+		if err := e.get("d", "gw", &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
+			return fmt.Errorf("statefulset still there: %v", err)
+		}
+		return nil
+	})
+	for i := 0; i < 2; i++ {
+		if err := e.get("d", proxy.StateSecretName("gw", i), &corev1.Secret{}); err != nil {
+			t.Errorf("state secret %d: %v", i, err)
+		}
+	}
+	if got := e.ts.deletedDevices(); len(got) != 0 {
+		t.Errorf("devices deleted without the Gateway being deleted: %v", got)
+	}
+
+	// The class comes back, and so does the proxy.
+	e.create(class())
+	sts := &appsv1.StatefulSet{}
+	e.eventually("proxy back", func() error { return e.get("d", "gw", sts) })
+
+	// Deletion: the devices stay while a proxy pod is still draining.
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "d", Name: "gw-0", Labels: proxy.SelectorLabels("gw"),
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "gw", UID: sts.UID, Controller: ptr.To(true)}}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "example"}}},
+	}
+	e.create(pod)
+	gw := &gwv1.Gateway{}
+	_ = e.get("d", "gw", gw)
+	if err := e.c.Delete(e.ctx, gw); err != nil {
+		t.Fatal(err)
+	}
+	e.eventually("statefulset deleted first", func() error {
+		if err := e.get("d", "gw", &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
+			return fmt.Errorf("statefulset still there: %v", err)
+		}
+		return nil
+	})
+	// As under foreground deletion, the state Secrets go before the
+	// finalizer runs to the end.
+	for i := 0; i < 2; i++ {
+		if err := e.c.Delete(e.ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "d", Name: proxy.StateSecretName("gw", i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(2 * time.Second)
+	if got := e.ts.deletedDevices(); len(got) != 0 {
+		t.Errorf("devices deleted while a pod still runs: %v", got)
+	}
+	if err := e.get("d", "gw", &gwv1.Gateway{}); err != nil {
+		t.Errorf("gateway gone before its pods: %v", err)
+	}
+	if err := e.c.Delete(e.ctx, pod, client.GracePeriodSeconds(0)); err != nil {
+		t.Fatal(err)
+	}
+	e.eventually("gateway gone", func() error {
+		if err := e.get("d", "gw", &gwv1.Gateway{}); !apierrors.IsNotFound(err) {
+			return fmt.Errorf("still there: %v", err)
+		}
+		return nil
+	})
+	got := e.ts.deletedDevices()
+	if !slices.Contains(got, "dev0") || !slices.Contains(got, "dev1") {
+		t.Errorf("deleted devices = %v", got)
+	}
+	e.eventually("class released", func() error {
+		gc := &gwv1.GatewayClass{}
+		if err := e.get("", "tailnet", gc); err != nil {
+			return err
+		}
+		if len(gc.Finalizers) != 0 {
+			return fmt.Errorf("finalizers = %v", gc.Finalizers)
+		}
+		return nil
 	})
 }

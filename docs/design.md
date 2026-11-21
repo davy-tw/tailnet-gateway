@@ -63,7 +63,9 @@ loaded from an optional Secret in the controller's namespace.
 
 Without OAuth credentials the controller logs a warning and keeps running.
 The user supplies an auth key per Gateway by creating a Secret named after
-the Gateway with an `authkey` entry. Gateways without one stay
+the Gateway with an `authkey` entry. The controller reads it from the API
+server when it needs a key; it does not watch or cache users' Secrets, and
+picks up a new one on its next retry. Gateways without one stay
 `Programmed=False` with reason `Pending` and a message saying that an auth
 key, or OAuth, is needed. Device cleanup on deletion is skipped with a
 warning; devices from ephemeral keys still expire on their own. Because
@@ -242,7 +244,8 @@ created.
   `ResolvedRefs`, and each listener reports `attachedRoutes`.
 - The controller watches routes, ReferenceGrants, BackendTLSPolicies,
   Services, Namespaces and the owned objects, and enqueues the affected
-  Gateways.
+  Gateways. Its cache holds only the Secrets it labels as its own (the
+  state Secrets), never the rest of the cluster's Secrets.
 
 ## Translation to the serve config
 
@@ -291,7 +294,10 @@ dropped silently. One route never fails the whole Gateway.
   both Gateways' backends. The oldest Gateway holding a name keeps it, and
   routes of newer Gateways that map to it get `Conflicted`. A Gateway holds
   the names it serves and the ones waiting for the tailnet domain; each
-  Gateway lists them in an annotation of its serve config ConfigMap.
+  Gateway lists them in an annotation of its serve config ConfigMap. Only a
+  ConfigMap named after its controlling Gateway, whose class this controller
+  serves, and that this controller applied counts, so a hand-made copy
+  cannot reserve names.
 - Tailscale Services must be defined, and their hosts approved, in the
   tailnet. The controller does not manage them. Hosts must be tagged
   devices, and new replicas wait for approval unless the tailnet policy has
@@ -348,8 +354,12 @@ known, web handlers are left out and the Gateway stays `Programmed=False`.
   `Accepted=False` with the reason.
 - `Programmed=False` with reason `Pending` while a step fails (minting keys,
   applying objects) or no replica is ready, and rechecked every few seconds.
-  `Programmed=True` once at least one replica is ready. Both messages carry
-  the ready and desired counts, so a degraded Gateway is visible.
+  `Programmed=True` once at least one replica is ready. A step that fails
+  while replicas are ready (a key that could not be minted while scaling
+  up, an API rate limit) keeps `Programmed=True` and the addresses, since
+  those replicas still serve, and the error goes into the message. Both
+  messages carry the ready and desired counts, so a degraded Gateway is
+  visible.
 - Listener status: kinds supported per protocol (HTTP and HTTPS: HTTPRoute
   and GRPCRoute; TLS: TLSRoute; TCP: TCPRoute), `attachedRoutes`, and
   `Accepted=False` with `UnsupportedProtocol` for UDP.
@@ -362,7 +372,10 @@ known, web handlers are left out and the Gateway stays `Programmed=False`.
 Applies to Ingresses whose `spec.ingressClassName` is the configured
 IngressClass, or that have none while that class is the cluster default,
 and only while that IngressClass names this controller in
-`spec.controller`.
+`spec.controller`. An Ingress without `spec.ingressClassName` that sets the
+deprecated `kubernetes.io/ingress.class` annotation belongs to the class it
+names: it is served only when that is the configured class, never as a
+default-class Ingress.
 For Ingress `I`, the controller applies a Gateway `I` and HTTPRoutes owned by
 the Ingress and annotated `source: ingress`:
 
@@ -417,13 +430,33 @@ Service.
 
 ## Gateway deletion
 
-The controller adds its finalizer to each Gateway. On deletion it reads
-every state Secret `N-<i>` and, in OAuth mode, deletes each recorded device
-through the Tailscale API (in manual key mode it skips this with a warning),
-then removes the finalizer and lets garbage collection remove the owned
-objects. A missing state Secret means there is nothing to clean up and never
-blocks deletion. Ephemeral devices that go offline are also removed by
-Tailscale after a while.
+The controller adds its finalizer to each Gateway, and records the device
+ID of every replica in the Gateway's `tailnet-gateway.davy.tw/devices`
+annotation as soon as a state Secret holds one. On deletion it:
+
+1. deletes the proxy StatefulSet and waits until its pods are gone, so the
+   replicas drain while their devices still serve;
+2. in OAuth mode, deletes every device listed in the state Secrets or the
+   annotation through the Tailscale API (in manual key mode it skips this
+   with a warning). The annotation is what keeps this working under
+   foreground cascading deletion, where garbage collection removes the
+   state Secrets before the finalizer runs;
+3. removes the finalizer and lets garbage collection remove the owned
+   objects.
+
+A missing state Secret means there is nothing to clean up and never blocks
+deletion. Ephemeral devices that go offline are also removed by Tailscale
+after a while. A Gateway that moves to another controller's class is
+cleaned up the same way, and its generated objects and state Secrets are
+deleted too.
+
+Devices are only deleted with the Gateway. While a GatewayClass has
+Gateways, the controller keeps the standard
+`gateway-exists-finalizer.gateway.networking.k8s.io` finalizer on it. If the
+class disappears anyway, its Gateways are treated like Gateways of an
+invalid class: `Accepted=False` with reason `Pending`, the StatefulSets
+removed, and the state Secrets and devices kept, so the replicas come back
+as the same devices when the class is recreated.
 
 ## Operations
 

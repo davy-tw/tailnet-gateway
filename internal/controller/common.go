@@ -5,22 +5,47 @@ import (
 	"context"
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	"go.pkgs.davy.tw/tailnet-gateway/internal/proxy"
 	"go.pkgs.davy.tw/tailnet-gateway/internal/translate"
 )
 
 // FieldOwner is the server-side apply field manager.
 const FieldOwner = "tailnet-gateway"
+
+// CacheOptions limits what the manager's informers hold. Only the
+// controller's own Secrets (the replicas' state) are cached; any other
+// Secret, such as a user's auth key Secret, is read from the API server
+// when needed, so the controller never keeps the cluster's Secrets in
+// memory.
+func CacheOptions() cache.Options {
+	return cache.Options{ByObject: map[client.Object]cache.ByObject{
+		&corev1.Secret{}: {Label: labels.SelectorFromSet(labels.Set{proxy.LabelManagedBy: proxy.ManagedBy})},
+	}}
+}
+
+// ClientOptions makes the manager's client read objects that are only
+// needed occasionally directly instead of caching every one in the cluster.
+func ClientOptions() client.Options {
+	return client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{
+		&corev1.Pod{}, &corev1.ServiceAccount{}, &rbacv1.Role{}, &rbacv1.RoleBinding{}, &policyv1.PodDisruptionBudget{},
+	}}}
+}
 
 // Features records which optional Gateway API kinds the cluster serves.
 type Features struct {
