@@ -49,5 +49,13 @@ Service VIP is the code exercised here.
    (`<service>.<tailnet>.ts.net`) and adds `X-Forwarded-*` and Tailscale
    identity headers.
 5. The image auto-advertises every Service in the serve config by default
-   (`TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT` defaults to true); the
-   postStart `advertise` hook is kept anyway as the documented behaviour.
+   (`TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT` defaults to true), but in
+   v1.104.7 only for the config it starts with: when the mounted file
+   changes, the new config is applied and the advertised list is left as
+   it was, so a new listener hostname is never advertised. The proxies
+   therefore turn it off, and the readiness probe advertises and drains
+   Services to match the running config (`tailscale debug prefs` shows the
+   `AdvertiseServices` list as indented JSON; a debug command, so recheck
+   it on every image upgrade). `serve advertise` and `serve drain` each
+   read the prefs and write the whole list back, so concurrent calls can
+   undo each other.

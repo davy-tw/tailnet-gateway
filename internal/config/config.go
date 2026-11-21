@@ -50,7 +50,9 @@ const (
 )
 
 // DefaultProxyImage is the pinned Tailscale image used for proxy pods.
-// Tailscale Services hosting needs v1.86.0 or later.
+// Tailscale Services hosting needs v1.86.0 or later. When bumping it,
+// recheck that "tailscale debug prefs" still prints an AdvertiseServices
+// field (see proxy.ReadyScript): without it, no replica becomes ready.
 const DefaultProxyImage = "tailscale/tailscale:v1.104.7"
 
 // MaxReplicas bounds the proxy replicas per Gateway. Each replica is a

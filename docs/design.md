@@ -194,16 +194,38 @@ long) is reset and re-registered.
   serve-config environment variable, so the container applies it on start
   and on change.
 - Pod name, UID and IP come from the downward API, as the image expects.
-- After start, a hook runs `tailscale serve advertise svc:<name>` for every
-  Tailscale Service in the config. Before stop, a hook runs
-  `tailscale serve drain svc:<name>` for each (ignoring failures) and waits,
-  so `terminationGracePeriodSeconds` covers the drain window.
-- A replica is ready once tailscaled is up and runs the mounted serve
-  config: `tailscale serve status --json` must hold the same strings (keys,
-  hostnames, paths and targets) as the mounted file, so any change of
-  backend, path, port or mode counts. Having a tailnet IP alone is not
-  enough, since the Gateway counts ready replicas and the PDB lets another
-  replica go.
+- Advertisement follows the mounted config, not only the one a replica
+  starts with. Once a replica runs the mounted config, the readiness probe
+  runs `tailscale serve advertise svc:<name>` for every Tailscale Service in
+  it that is not advertised yet, and `tailscale serve drain svc:<name>` for
+  every advertised one no longer in it, so adding, renaming or removing a
+  listener hostname takes effect without restarting the replicas. Until the
+  config runs, the probe only drains advertised names found in neither the
+  mounted nor the running config (stale ones, which a replica killed
+  without its stop hook keeps in its state Secret). The image's own
+  auto-advertisement is turned off: it only follows the config the
+  container starts with, and could advertise again during a drain. The
+  advertised list is read from `tailscale debug prefs`; if its output has
+  no `AdvertiseServices` field, the replica stays not ready rather than
+  advertising blindly, so the parsing must be rechecked when the pinned
+  image is upgraded. The probe has a 10 s timeout, since a run that adds
+  Services starts one CLI process per Service.
+- Before stop, a hook marks the replica as draining, runs
+  `tailscale serve drain svc:<name>` for each Service in the config or
+  advertised (ignoring failures), waits out any probe run already in
+  progress (the probe timeout plus one second), drains again, and waits for
+  the rest of the drain window, so `terminationGracePeriodSeconds` covers
+  it. The second drain covers a probe run that passed the marker check
+  before the hook created it, or whose write undid the first drain (the CLI
+  rewrites the whole advertised list). A draining replica is not ready, and
+  the probe checks the marker again before each advertise.
+- A replica is ready once tailscaled is up, runs the mounted serve config
+  and advertises exactly its Services. `tailscale serve status --json` must
+  hold the same strings (keys, hostnames, paths and targets) as the mounted
+  file, so any change of backend, path, port or mode counts, and the
+  `AdvertiseServices` prefs must list the config's Services. Having a
+  tailnet IP alone is not enough, since the Gateway counts ready replicas
+  and the PDB lets another replica go.
 - Soft pod anti-affinity on `kubernetes.io/hostname` and topology spread
   across zones keep one node or zone from taking out every replica.
 - Pod management policy `Parallel`: replicas are independent.

@@ -147,7 +147,8 @@ and one state Secret `N-<i>` per replica.
   `<NS>-<N>-<i>`. A replica is ready once it runs the current serve config.
   Gateway names are limited to 52 characters. A rescheduled replica finds its state Secret
   and comes back as the same device.
-- After start, each replica advertises its Tailscale Services; before stop it
+- Each replica advertises the Tailscale Services of its current serve
+  config, and follows changes to it without a restart; before stop it
   runs `tailscale serve drain` for each and waits for the grace period, so
   `kubectl drain` moves replicas one at a time without dropping traffic.
 - Replicas are spread across nodes (soft anti-affinity) and zones.
