@@ -1,0 +1,9 @@
+# Manual key mode (no OAuth client): one Secret per Gateway, named after it.
+# Use a reusable, ephemeral, pre-authorized, tagged auth key.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: demo
+  namespace: tailnet-demo
+stringData:
+  authkey: tskey-auth-REPLACE-ME
