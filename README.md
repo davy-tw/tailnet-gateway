@@ -180,7 +180,7 @@ RBAC as `dist/install.yaml`.
 [`.github/workflows/release.yaml`](.github/workflows/release.yaml) publishes
 to GHCR:
 
-- every push to `main`: image `ghcr.io/davy-tw/tailnet-gateway:main` and
+- every push to `main`: image `ghcr.io/davy-tw/tailnet-gateway/controller:main` and
   `:sha-<commit>`;
 - every tag `vX.Y.Z`: image `:X.Y.Z`, `:X.Y` and `:latest` (amd64 and arm64),
   chart `oci://ghcr.io/davy-tw/charts/tailnet-gateway` version `X.Y.Z`, and a

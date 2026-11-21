@@ -2,7 +2,7 @@
 # before the controller; this chart does not install them.
 
 image:
-  repository: ghcr.io/davy-tw/tailnet-gateway
+  repository: ghcr.io/davy-tw/tailnet-gateway/controller
   # Defaults to the chart's appVersion.
   tag: ""
   pullPolicy: IfNotPresent
