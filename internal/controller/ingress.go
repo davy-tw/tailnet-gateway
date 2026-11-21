@@ -91,10 +91,11 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		var ce *conflictError
 		if errors.As(err, &ce) {
 			r.warn(ing, "NameConflict", "%s", ce.msg)
-			return ctrl.Result{}, nil
+			return ctrl.Result{RequeueAfter: conflictRequeue}, nil
 		}
 		return ctrl.Result{}, err
 	}
+	conflicted := false
 	keep := map[string]bool{}
 	for _, rt := range routes {
 		keep[rt.Name] = true
@@ -102,6 +103,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			var ce *conflictError
 			if errors.As(err, &ce) {
 				r.warn(ing, "NameConflict", "%s", ce.msg)
+				conflicted = true
 				continue
 			}
 			return ctrl.Result{}, err
@@ -110,7 +112,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.pruneGenerated(ctx, ing, config.SourceIngress, &gwv1.HTTPRouteList{}, keep); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{}, r.writeStatus(ctx, ing, r.gatewayHostnames(ctx, ing.Namespace, ing.Name))
+	return requeueIf(conflicted), r.writeStatus(ctx, ing, r.gatewayHostnames(ctx, ing.Namespace, ing.Name))
 }
 
 // cleanup removes the generated objects; clearStatus also clears the
@@ -157,6 +159,10 @@ func (r *IngressReconciler) translate(ctx context.Context, ing *networkingv1.Ing
 	type group struct {
 		host  string
 		rules []gwv1.HTTPRouteRule
+		// broken groups have a path whose backend cannot be used. They
+		// are not served at all: leaving the path out would send its
+		// requests to a shorter prefix that belongs to another backend.
+		broken bool
 	}
 	var groups []*group
 	byHost := map[string]*group{}
@@ -173,6 +179,7 @@ func (r *IngressReconciler) translate(ctx context.Context, ing *networkingv1.Ing
 		for _, p := range rule.HTTP.Paths {
 			be, ok := r.backendRef(ctx, ing, p.Backend)
 			if !ok {
+				g.broken = true
 				continue
 			}
 			path := p.Path
@@ -213,6 +220,14 @@ func (r *IngressReconciler) translate(ctx context.Context, ing *networkingv1.Ing
 	}
 	var routes []*gwv1.HTTPRoute
 	for i, g := range groups {
+		if g.broken {
+			host := g.host
+			if host == "" {
+				host = "(no host)"
+			}
+			r.warn(ing, "HostNotServed", "host %s is not served until all of its backends resolve", host)
+			continue
+		}
 		if len(g.rules) == 0 {
 			continue
 		}
@@ -308,6 +323,7 @@ func (r *IngressReconciler) allIngresses(ctx context.Context, _ client.Object) [
 
 // SetupWithManager registers the reconciler.
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.APIReader = mgr.GetAPIReader()
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("ingress").
 		For(&networkingv1.Ingress{}).

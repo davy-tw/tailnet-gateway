@@ -27,6 +27,16 @@ import (
 type classResolver struct {
 	client.Client
 	Config *config.Config
+	// APIReader reads from the API server, bypassing the cache. It is set
+	// from the manager; when nil, the client is used.
+	APIReader client.Reader
+}
+
+func (r *classResolver) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
 }
 
 // managedClass returns the GatewayClass if this controller serves it.

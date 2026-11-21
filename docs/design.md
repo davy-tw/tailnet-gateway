@@ -47,7 +47,7 @@ loaded from an optional Secret in the controller's namespace.
 | --- | --- | --- |
 | OAuth client ID and secret | unset | Used to mint auth keys and delete devices. Without them the controller runs in manual key mode |
 | Device tags (per class) | unset | Comma-separated tags requested on minted keys. Unset lets the OAuth client's own tags apply |
-| Proxy replicas (per class) | `2` | Proxy pods per Gateway |
+| Proxy replicas (per class) | `2` | Proxy pods per Gateway, from 1 to 64 |
 | Proxy image (per class) | a pinned `tailscale/tailscale` tag | At least v1.86.0, the first release that can host Tailscale Services |
 | Drain grace period (per class) | `30s` | Pod termination grace period, covering the drain |
 | GatewayClass controller name | see [Names](#names) | Every GatewayClass with this `controllerName` is served |
@@ -88,7 +88,10 @@ keys, each optional and falling back to the controller default: `tags`,
 
 - Unknown keys are ignored with a warning.
 - Invalid values or a missing ConfigMap make the class `Accepted=False` with
-  reason `InvalidParameters`, and its Gateways are not programmed.
+  reason `InvalidParameters`, and its Gateways are not programmed: their
+  proxy StatefulSets are removed until the class is valid again. The same
+  goes for a Gateway that is not accepted. State Secrets are kept, so the
+  replicas come back as the same devices.
 - A valid class is `Accepted=True`. The controller watches the ConfigMap and
   re-reconciles the class's Gateways when it changes.
 - Changing `tags` only affects keys minted afterwards. Existing devices keep
@@ -186,15 +189,20 @@ long) is reset and re-registered.
   Tailscale Service in the config. Before stop, a hook runs
   `tailscale serve drain svc:<name>` for each (ignoring failures) and waits,
   so `terminationGracePeriodSeconds` covers the drain window.
-- A replica is ready once tailscaled is up and runs a serve config with
-  exactly the Tailscale Services of the mounted one (checked with
-  `tailscale serve status`). Having a tailnet IP alone is not enough, since
-  the Gateway counts ready replicas and the PDB lets another replica go.
+- A replica is ready once tailscaled is up and runs the mounted serve
+  config: `tailscale serve status --json` must hold the same strings (keys,
+  hostnames, paths and targets) as the mounted file, so any change of
+  backend, path, port or mode counts. Having a tailnet IP alone is not
+  enough, since the Gateway counts ready replicas and the PDB lets another
+  replica go.
 - Soft pod anti-affinity on `kubernetes.io/hostname` and topology spread
   across zones keep one node or zone from taking out every replica.
 - Pod management policy `Parallel`: replicas are independent.
 - The selector uses a fixed app label and an instance label equal to the
   Gateway name. It is immutable, so other labels never go into it.
+- Pods get the labels of the Gateway's `spec.infrastructure.labels`, not
+  the Gateway's own labels, which could make them match the selector of an
+  unrelated Service.
 - Gateway names are limited to 52 characters: the StatefulSet's pods carry
   a `<name>-<hash>` revision label, and label values are limited to 63.
   Longer names leave the Gateway `Programmed=False`.
@@ -280,8 +288,10 @@ dropped silently. One route never fails the whole Gateway.
   `Conflicted`.
 - Tailscale Service names are tailnet-wide, so a name belongs to one
   Gateway: if two Gateways advertised it, its traffic would be spread over
-  both Gateways' backends. The oldest Gateway serving a name keeps it, and
-  routes of newer Gateways that map to it get `Conflicted`.
+  both Gateways' backends. The oldest Gateway holding a name keeps it, and
+  routes of newer Gateways that map to it get `Conflicted`. A Gateway holds
+  the names it serves and the ones waiting for the tailnet domain; each
+  Gateway lists them in an annotation of its serve config ConfigMap.
 - Tailscale Services must be defined, and their hosts approved, in the
   tailnet. The controller does not manage them. Hosts must be tagged
   devices, and new replicas wait for approval unless the tailnet policy has
@@ -362,8 +372,12 @@ the Ingress and annotated `source: ingress`:
   `ImplementationSpecific` and unset path types become `PathPrefix`. `Exact`
   stays `Exact`, so the HTTPRoute reports it as unsupported, and a warning
   event is recorded on the Ingress.
-- Named ports are resolved through the Service. Backends that are not
-  Services are skipped with a warning event.
+- Named ports are resolved through the Service. A host with a backend that
+  cannot be used (not a Service, or an unknown named port) is not served
+  until it resolves, with a warning event: leaving out only that path would
+  send its requests to a shorter prefix of another backend.
+- Rules without a host go to the route without hostnames, as with other
+  Ingress controllers, where a host's own rules take precedence.
 - `defaultBackend` takes the requests no rule matches: it is added as a
   `/` rule to every host that has none, and to a route without hostnames
   for hosts without rules.
@@ -378,7 +392,10 @@ configured LoadBalancer class. The controller adds its finalizer to the
 Service.
 
 - The `hostname` annotation names the Tailscale Service (default: the
-  Service's name) and switches on HTTP handling for one port: the first TCP
+  Service's name). It is a single DNS label or a name under the tailnet,
+  reduced to its first label; anything else is reported in a warning event
+  and the Service is not exposed. It also switches on HTTP handling for one
+  port: the first TCP
   port whose `appProtocol` is `http` or `kubernetes.io/ws`, or else the
   first TCP port whose `appProtocol` is not `kubernetes.io/h2c`, `https` or
   `kubernetes.io/wss`, gets an HTTP listener and an HTTPRoute. h2c needs

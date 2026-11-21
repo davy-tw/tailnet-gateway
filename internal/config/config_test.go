@@ -83,7 +83,7 @@ func TestParseClassParams(t *testing.T) {
 		t.Errorf("unknown = %v", unknown)
 	}
 	for _, bad := range []map[string]string{
-		{"replicas": "0"}, {"replicas": "x"}, {"drainGracePeriod": "soon"}, {"tags": "tag:"}, {"image": "a b"},
+		{"replicas": "0"}, {"replicas": "x"}, {"replicas": "65"}, {"drainGracePeriod": "soon"}, {"tags": "tag:"}, {"image": "a b"},
 	} {
 		if _, _, err := ParseClassParams(bad, def); err == nil {
 			t.Errorf("%v: expected error", bad)

@@ -31,6 +31,11 @@ const (
 	// LoadBalancer Service shares one Tailscale Service.
 	AnnotationTailscaleService = Domain + "/tailscale-service"
 
+	// AnnotationTailscaleServices on a Gateway's serve config ConfigMap
+	// lists every Tailscale Service name the Gateway holds, including ones
+	// not in the config yet (see the Gateway reconciler's claims).
+	AnnotationTailscaleServices = Domain + "/tailscale-services"
+
 	LabelSourceKind = Domain + "/source-kind"
 	LabelSourceName = Domain + "/source-name"
 
@@ -41,6 +46,11 @@ const (
 // DefaultProxyImage is the pinned Tailscale image used for proxy pods.
 // Tailscale Services hosting needs v1.86.0 or later.
 const DefaultProxyImage = "tailscale/tailscale:v1.104.7"
+
+// MaxReplicas bounds the proxy replicas per Gateway. Each replica is a
+// tailnet device with its own state Secret, so the bound also keeps a typo
+// from minting thousands of keys.
+const MaxReplicas = 64
 
 // ClassParams are the settings that a GatewayClass may override.
 type ClassParams struct {
@@ -180,8 +190,8 @@ func ParseClassParams(data map[string]string, defaults ClassParams) (ClassParams
 				continue
 			}
 			n, err := strconv.ParseInt(v, 10, 32)
-			if err != nil || n < 1 {
-				return p, nil, fmt.Errorf("%s: %q is not a positive integer", ParamReplicas, v)
+			if err != nil || n < 1 || n > MaxReplicas {
+				return p, nil, fmt.Errorf("%s: %q is not an integer from 1 to %d", ParamReplicas, v, MaxReplicas)
 			}
 			p.Replicas = int32(n)
 		case ParamImage:

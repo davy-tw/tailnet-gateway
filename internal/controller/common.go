@@ -6,9 +6,11 @@ import (
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
@@ -92,10 +94,39 @@ func apply(ctx context.Context, c client.Client, scheme *runtime.Scheme, obj cli
 	if err != nil {
 		return err
 	}
-	return applyWithGVK(ctx, c, obj, gvk)
+	return applyWithGVK(ctx, c, obj, gvk, "")
 }
 
-func applyWithGVK(ctx context.Context, c client.Client, obj client.Object, gvk schema.GroupVersionKind) error {
+// applyControlled applies obj only if no object of that name exists, or
+// the existing one is controlled by owner; otherwise it returns a
+// *conflictError and leaves the object alone. Taking an object over would
+// make it a child of owner, and garbage collection would delete it with
+// owner. The existing object is read from the API server, and its UID is
+// sent as a precondition, so that an object replaced in between is not
+// taken over either.
+func applyControlled(ctx context.Context, c client.Client, rd client.Reader, scheme *runtime.Scheme, obj client.Object, owner metav1.Object) error {
+	gvk, err := apiutil.GVKForObject(obj, scheme)
+	if err != nil {
+		return err
+	}
+	cur := obj.DeepCopyObject().(client.Object)
+	var uid types.UID
+	switch err := rd.Get(ctx, client.ObjectKeyFromObject(obj), cur); {
+	case apierrors.IsNotFound(err):
+	case err != nil:
+		return err
+	case !metav1.IsControlledBy(cur, owner):
+		return &conflictError{fmt.Sprintf("%s %s/%s exists and is not owned by this object", gvk.Kind, obj.GetNamespace(), obj.GetName())}
+	default:
+		uid = cur.GetUID()
+	}
+	if err := applyWithGVK(ctx, c, obj, gvk, uid); err != nil {
+		return fmt.Errorf("applying %s %s: %w", gvk.Kind, obj.GetName(), err)
+	}
+	return nil
+}
+
+func applyWithGVK(ctx context.Context, c client.Client, obj client.Object, gvk schema.GroupVersionKind, uid types.UID) error {
 	m, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 	if err != nil {
 		return err
@@ -105,6 +136,9 @@ func applyWithGVK(ctx context.Context, c client.Client, obj client.Object, gvk s
 	delete(u.Object, "status")
 	unstructured.RemoveNestedField(u.Object, "metadata", "creationTimestamp")
 	unstructured.RemoveNestedField(u.Object, "spec", "template", "metadata", "creationTimestamp")
+	if uid != "" {
+		u.SetUID(uid) // a precondition: the apply fails if the object was replaced
+	}
 	return c.Apply(ctx, client.ApplyConfigurationFromUnstructured(u), client.FieldOwner(FieldOwner), client.ForceOwnership)
 }
 

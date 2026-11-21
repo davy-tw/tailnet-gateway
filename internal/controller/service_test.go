@@ -53,6 +53,18 @@ func TestPlanService(t *testing.T) {
 	}
 }
 
+func TestPlanServiceHostname(t *testing.T) {
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "app", Annotations: map[string]string{config.AnnotationHostname: "db.tail1234.ts.net"}},
+		Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "pg", Port: 5432, AppProtocol: ptr.To("https")}}}}
+	if plan := PlanService(svc); plan.Label != "db" || plan.Invalid != "" {
+		t.Errorf("tailnet name: %+v", plan)
+	}
+	svc.Annotations[config.AnnotationHostname] = "bad_host"
+	if plan := PlanService(svc); plan.Invalid == "" {
+		t.Errorf("invalid hostname accepted: %+v", plan)
+	}
+}
+
 func TestDomainFromFQDN(t *testing.T) {
 	for in, want := range map[string]string{
 		"gw-0.tail1234.ts.net.": "tail1234.ts.net",

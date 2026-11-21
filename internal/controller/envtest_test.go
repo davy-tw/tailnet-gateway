@@ -235,8 +235,10 @@ func TestEnvtestGatewayLifecycle(t *testing.T) {
 	})
 
 	gw := &gwv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "demo", Name: "demo", Labels: map[string]string{"team": "a"}},
-		Spec: gwv1.GatewaySpec{GatewayClassName: "tailnet", Listeners: []gwv1.Listener{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "demo", Name: "demo", Labels: map[string]string{"app": "web"}},
+		Spec: gwv1.GatewaySpec{GatewayClassName: "tailnet", Infrastructure: &gwv1.GatewayInfrastructure{
+			Labels: map[gwv1.LabelKey]gwv1.LabelValue{"team": "a"},
+		}, Listeners: []gwv1.Listener{
 			{Name: "http", Protocol: gwv1.HTTPProtocolType, Port: 80},
 		}},
 	}
@@ -274,7 +276,10 @@ func TestEnvtestGatewayLifecycle(t *testing.T) {
 		t.Errorf("statefulset spec: replicas=%d policy=%s", *sts.Spec.Replicas, sts.Spec.PodManagementPolicy)
 	}
 	if sts.Spec.Template.Labels["team"] != "a" || sts.Spec.Selector.MatchLabels["team"] != "" {
-		t.Errorf("gateway labels must reach pods but not the selector: %v / %v", sts.Spec.Template.Labels, sts.Spec.Selector.MatchLabels)
+		t.Errorf("infrastructure labels must reach pods but not the selector: %v / %v", sts.Spec.Template.Labels, sts.Spec.Selector.MatchLabels)
+	}
+	if _, ok := sts.Spec.Template.Labels["app"]; ok {
+		t.Errorf("the Gateway's own labels must not reach pods: %v", sts.Spec.Template.Labels)
 	}
 	role := &rbacv1.Role{}
 	_ = e.get("demo", "demo", role)
@@ -407,6 +412,10 @@ func TestEnvtestGatewayLifecycle(t *testing.T) {
 		c := meta.FindStatusCondition(g.Status.Conditions, "Accepted")
 		if c == nil || c.Reason != "InvalidParameters" {
 			return fmt.Errorf("accepted = %+v", c)
+		}
+		// A rejected Gateway stops serving.
+		if err := e.get("demo", "demo", &appsv1.StatefulSet{}); !apierrors.IsNotFound(err) {
+			return fmt.Errorf("statefulset still there: %v", err)
 		}
 		return nil
 	})
@@ -711,6 +720,15 @@ func TestEnvtestOwnership(t *testing.T) {
 	_ = e.get("one", "taken", sa)
 	if len(sa.OwnerReferences) != 0 {
 		t.Errorf("ServiceAccount was taken over: %+v", sa.OwnerReferences)
+	}
+
+	// The UID sent with an apply is a precondition: a replaced object is
+	// not taken over.
+	e.create(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "one", Name: "uid-check"}})
+	err := applyWithGVK(e.ctx, e.c, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "one", Name: "uid-check"}, Data: map[string]string{"a": "b"}},
+		corev1.SchemeGroupVersion.WithKind("ConfigMap"), "00000000-0000-0000-0000-000000000000")
+	if err == nil {
+		t.Error("apply with another object's UID must fail")
 	}
 
 	// The older Gateway keeps a Tailscale Service name.

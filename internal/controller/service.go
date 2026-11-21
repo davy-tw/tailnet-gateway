@@ -18,6 +18,7 @@ import (
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"go.pkgs.davy.tw/tailnet-gateway/internal/config"
+	"go.pkgs.davy.tw/tailnet-gateway/internal/translate"
 )
 
 // ServiceReconciler translates LoadBalancer Services of the configured
@@ -89,6 +90,10 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	plan := PlanService(svc)
+	if plan.Invalid != "" {
+		r.warn(svc, "InvalidHostname", "%s", plan.Invalid)
+		return ctrl.Result{}, r.release(ctx, svc)
+	}
 	for _, w := range plan.Warnings {
 		r.warn(svc, "UnsupportedPort", "%s", w)
 	}
@@ -105,21 +110,32 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		var ce *conflictError
 		if errors.As(err, &ce) {
 			r.warn(svc, "NameConflict", "%s", ce.msg)
-			return ctrl.Result{}, nil
+			return ctrl.Result{RequeueAfter: conflictRequeue}, nil
 		}
 		return ctrl.Result{}, err
+	}
+	conflicted := false
+	applyRoute := func(rt client.Object) error {
+		err := r.applyGenerated(ctx, svc, rt)
+		var ce *conflictError
+		if errors.As(err, &ce) {
+			r.warn(svc, "NameConflict", "%s", ce.msg)
+			conflicted = true
+			return nil
+		}
+		return err
 	}
 	keepHTTP, keepTCP := map[string]bool{}, map[string]bool{}
 	for _, rt := range httpRoutes {
 		keepHTTP[rt.Name] = true
-		if err := r.applyGenerated(ctx, svc, rt); err != nil {
-			return ctrl.Result{}, ignoreConflict(err, func(m string) { r.warn(svc, "NameConflict", "%s", m) })
+		if err := applyRoute(rt); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 	for _, rt := range tcpRoutes {
 		keepTCP[rt.Name] = true
-		if err := r.applyGenerated(ctx, svc, rt); err != nil {
-			return ctrl.Result{}, ignoreConflict(err, func(m string) { r.warn(svc, "NameConflict", "%s", m) })
+		if err := applyRoute(rt); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 	if err := r.pruneGenerated(ctx, svc, config.SourceService, &gwv1.HTTPRouteList{}, keepHTTP); err != nil {
@@ -130,16 +146,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, err
 		}
 	}
-	return ctrl.Result{}, r.writeStatus(ctx, svc, r.gatewayHostnames(ctx, svc.Namespace, svc.Name))
-}
-
-func ignoreConflict(err error, report func(string)) error {
-	var ce *conflictError
-	if errors.As(err, &ce) {
-		report(ce.msg)
-		return nil
-	}
-	return err
+	return requeueIf(conflicted), r.writeStatus(ctx, svc, r.gatewayHostnames(ctx, svc.Namespace, svc.Name))
 }
 
 func (r *ServiceReconciler) cleanup(ctx context.Context, svc *corev1.Service) error {
@@ -185,6 +192,8 @@ type ServicePlan struct {
 	HTTP     *corev1.ServicePort
 	TCP      []corev1.ServicePort
 	Warnings []string
+	// Invalid explains why the Service cannot be exposed at all.
+	Invalid string
 }
 
 var (
@@ -204,7 +213,14 @@ func PlanService(svc *corev1.Service) ServicePlan {
 	plan := ServicePlan{Label: svc.Name}
 	hostname := svc.Annotations[config.AnnotationHostname]
 	if hostname != "" {
-		plan.Label = hostname
+		// A single label, or a name under a tailnet, which is reduced to
+		// its first label like a route hostname.
+		label, err := translate.ServiceLabel(hostname, "")
+		if err != nil {
+			plan.Invalid = fmt.Sprintf("annotation %s: %v", config.AnnotationHostname, err)
+			return plan
+		}
+		plan.Label = label
 	}
 	var tcp []corev1.ServicePort
 	for _, p := range svc.Spec.Ports {
@@ -303,6 +319,7 @@ func (r *ServiceReconciler) managedServices(ctx context.Context, _ client.Object
 
 // SetupWithManager registers the reconciler.
 func (r *ServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.APIReader = mgr.GetAPIReader()
 	b := ctrl.NewControllerManagedBy(mgr).
 		Named("service").
 		For(&corev1.Service{}).

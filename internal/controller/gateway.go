@@ -24,7 +24,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -148,8 +147,10 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	switch {
 	case ip != nil:
 		progErr = &pendingError{"GatewayClass parameters are invalid: " + ip.msg}
+		statusErr = errors.Join(statusErr, r.withdraw(ctx, gw))
 	case !res.Accepted:
 		progErr = &pendingError{"Gateway is not accepted: " + res.AcceptedMessage}
+		statusErr = errors.Join(statusErr, r.withdraw(ctx, gw))
 	default:
 		sts, progErr = r.provision(ctx, gw, params, res)
 	}
@@ -298,9 +299,10 @@ func needsNamespaceLabels(gw *gwv1.Gateway) bool {
 }
 
 // claimedServices returns the Tailscale Service names that older Gateways
-// already serve, read from their serve config ConfigMaps. Names are
-// tailnet-wide: if two Gateways advertised the same name, its traffic would
-// be spread over both Gateways' backends. The oldest Gateway keeps a name.
+// hold, read from their serve config ConfigMaps: the names they serve and
+// the ones waiting for the tailnet domain. Names are tailnet-wide: if two
+// Gateways advertised the same name, its traffic would be spread over both
+// Gateways' backends. The oldest Gateway keeps a name.
 func (r *GatewayReconciler) claimedServices(ctx context.Context, gw *gwv1.Gateway) (map[string]string, error) {
 	var cms corev1.ConfigMapList
 	if err := r.List(ctx, &cms, client.MatchingLabels{proxy.LabelName: proxy.AppName, proxy.LabelManagedBy: proxy.ManagedBy}); err != nil {
@@ -323,12 +325,15 @@ func (r *GatewayReconciler) claimedServices(ctx context.Context, gw *gwv1.Gatewa
 		if other.UID != owner.UID || !olderGateway(other, gw) {
 			continue
 		}
+		labels := strings.Split(cm.Annotations[config.AnnotationTailscaleServices], ",")
 		var sc serveconf.Config
-		if err := json.Unmarshal([]byte(cm.Data[proxy.ServeConfigKey]), &sc); err != nil {
-			continue
+		if err := json.Unmarshal([]byte(cm.Data[proxy.ServeConfigKey]), &sc); err == nil {
+			labels = append(labels, sc.Labels()...)
 		}
-		for _, l := range sc.Labels() {
-			claimed[l] = other.Namespace + "/" + other.Name
+		for _, l := range labels {
+			if l != "" {
+				claimed[l] = other.Namespace + "/" + other.Name
+			}
 		}
 	}
 	return claimed, nil
@@ -408,14 +413,18 @@ func (r *GatewayReconciler) provision(ctx context.Context, gw *gwv1.Gateway, par
 		Namespace: gw.Namespace,
 		Gateway:   gw.Name,
 		Params:    params,
-		PodLabels: gw.Labels,
+		PodLabels: infrastructureLabels(gw),
 		Owner:     ownerRef(gw),
 	}
 	cfg, err := res.Config.Marshal()
 	if err != nil {
 		return nil, err
 	}
-	for _, obj := range []client.Object{spec.ServiceAccount(), spec.Role(), spec.RoleBinding(), spec.ConfigMap(cfg)} {
+	cm := spec.ConfigMap(cfg)
+	services := append([]string(nil), res.Services...)
+	sort.Strings(services)
+	cm.Annotations = map[string]string{config.AnnotationTailscaleServices: strings.Join(services, ",")}
+	for _, obj := range []client.Object{spec.ServiceAccount(), spec.Role(), spec.RoleBinding(), cm} {
 		if err := r.applyOwned(ctx, gw, obj); err != nil {
 			return nil, err
 		}
@@ -452,23 +461,35 @@ const maxGatewayNameLength = 52
 // over would make it a child of the Gateway, and garbage collection would
 // delete it with the Gateway.
 func (r *GatewayReconciler) applyOwned(ctx context.Context, gw *gwv1.Gateway, obj client.Object) error {
-	gvk, err := apiutil.GVKForObject(obj, r.Scheme)
-	if err != nil {
-		return err
+	err := applyControlled(ctx, r.Client, r.reader(), r.Scheme, obj, gw)
+	var ce *conflictError
+	if errors.As(err, &ce) {
+		return &pendingError{strings.Replace(ce.msg, "this object", "this Gateway", 1)}
 	}
-	cur := obj.DeepCopyObject().(client.Object)
-	err = r.Get(ctx, client.ObjectKeyFromObject(obj), cur)
-	switch {
-	case apierrors.IsNotFound(err):
-	case err != nil:
-		return err
-	case !metav1.IsControlledBy(cur, gw):
-		return &pendingError{fmt.Sprintf("%s %s/%s exists and is not owned by this Gateway", gvk.Kind, obj.GetNamespace(), obj.GetName())}
+	return err
+}
+
+// infrastructureLabels are the labels the Gateway asks for on its
+// generated resources (spec.infrastructure.labels). The Gateway's own
+// labels are not copied: they could make the proxy pods match the selector
+// of an unrelated Service.
+func infrastructureLabels(gw *gwv1.Gateway) map[string]string {
+	if gw.Spec.Infrastructure == nil {
+		return nil
 	}
-	if err := applyWithGVK(ctx, r.Client, obj, gvk); err != nil {
-		return fmt.Errorf("applying %s %s: %w", gvk.Kind, obj.GetName(), err)
+	out := map[string]string{}
+	for k, v := range gw.Spec.Infrastructure.Labels {
+		out[string(k)] = string(v)
 	}
-	return nil
+	return out
+}
+
+// withdraw stops serving a Gateway that is no longer accepted: its proxy
+// StatefulSet is deleted (the pods drain on the way out). State Secrets are
+// kept, so the replicas come back as the same devices once it is accepted
+// again.
+func (r *GatewayReconciler) withdraw(ctx context.Context, gw *gwv1.Gateway) error {
+	return r.deleteOwned(ctx, gw, &appsv1.StatefulSet{}, gw.Name)
 }
 
 func (r *GatewayReconciler) currentStatefulSet(ctx context.Context, gw *gwv1.Gateway) *appsv1.StatefulSet {
@@ -1122,6 +1143,7 @@ func (r *GatewayReconciler) gatewayForUserSecret(_ context.Context, obj client.O
 
 // SetupWithManager registers the reconciler and its watches.
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.APIReader = mgr.GetAPIReader()
 	routeHandler := handler.EnqueueRequestsFromMapFunc(r.gatewaysForRoute)
 	createDelete := predicate.Funcs{
 		CreateFunc:  func(event.CreateEvent) bool { return true },

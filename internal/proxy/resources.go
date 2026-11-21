@@ -147,16 +147,18 @@ func AdvertiseScript() string {
 	}, "\n")
 }
 
-// ReadyScript succeeds once tailscaled is up and the serve config it runs
-// has exactly the Tailscale Services of the mounted config: an IP alone
-// does not mean the replica serves the current config yet.
+// ReadyScript succeeds once tailscaled is up and runs the mounted serve
+// config: an IP alone does not mean the replica serves the current config.
+// The two JSON documents are compared by their strings (keys, hostnames,
+// paths and targets), which catches any change of backend, path, port or
+// mode; the mounted file is written with the same field names.
 func ReadyScript() string {
 	return strings.Join([]string{
 		"CFG=" + shellQuote(ServeConfigDir+"/"+ServeConfigKey),
 		"TS=" + shellQuote("tailscale --socket="+SocketPath),
 		`$TS status >/dev/null 2>&1 || exit 1`,
-		`want=$(` + servicesInConfig + `)`,
-		`have=$($TS serve status --json 2>/dev/null | grep -o '"svc:[a-z0-9-]*"' | tr -d '"' | sort -u)`,
+		`want=$(grep -o '"[^"]*"' "$CFG" | sort -u)`,
+		`have=$($TS serve status --json 2>/dev/null | grep -o '"[^"]*"' | sort -u)`,
 		`[ "$want" = "$have" ]`,
 	}, "\n")
 }

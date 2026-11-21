@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -10,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -36,6 +38,18 @@ func sourceMeta(owner client.Object, gvkKind, apiVersion, source, name string) m
 	}
 }
 
+// conflictRequeue is how often a source whose generated names are taken
+// checks again: deleting the object in the way does not enqueue the
+// source, since the source does not own it.
+const conflictRequeue = time.Minute
+
+func requeueIf(conflicted bool) ctrl.Result {
+	if conflicted {
+		return ctrl.Result{RequeueAfter: conflictRequeue}
+	}
+	return ctrl.Result{}
+}
+
 // conflictError is a generated object name already used by something else.
 type conflictError struct{ msg string }
 
@@ -44,16 +58,7 @@ func (e *conflictError) Error() string { return e.msg }
 // applyGenerated applies obj unless an object with that name exists and is
 // not controlled by owner.
 func (g *generator) applyGenerated(ctx context.Context, owner client.Object, obj client.Object) error {
-	existing := obj.DeepCopyObject().(client.Object)
-	err := g.Get(ctx, types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}, existing)
-	switch {
-	case apierrors.IsNotFound(err):
-	case err != nil:
-		return err
-	case !metav1.IsControlledBy(existing, owner):
-		return &conflictError{fmt.Sprintf("%T %s/%s already exists and is not managed by this object", obj, obj.GetNamespace(), obj.GetName())}
-	}
-	return apply(ctx, g.Client, g.Scheme, obj)
+	return applyControlled(ctx, g.Client, g.reader(), g.Scheme, obj, owner)
 }
 
 // pruneGenerated deletes objects of list's kind generated for owner whose

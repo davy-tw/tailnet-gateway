@@ -56,7 +56,7 @@ defaults that a GatewayClass can override.
 | --- | --- | --- |
 | `TAILSCALE_OAUTH_CLIENT_ID`, `TAILSCALE_OAUTH_CLIENT_SECRET` | unset | OAuth client for minting auth keys and deleting devices. Without them the controller runs in manual key mode |
 | `PROXY_TAGS` (per class) | unset | Comma-separated tags requested on minted keys. Unset: the OAuth client's tags apply |
-| `PROXY_REPLICAS` (per class) | `2` | Proxy pods per Gateway |
+| `PROXY_REPLICAS` (per class) | `2` | Proxy pods per Gateway (1 to 64) |
 | `PROXY_IMAGE` (per class) | `tailscale/tailscale:v1.104.7` | Proxy image |
 | `PROXY_DRAIN_GRACE_PERIOD` (per class) | `30s` | Pod termination grace period, covering the drain |
 | `GATEWAY_CONTROLLER_NAME` | `tailnet-gateway.davy.tw/gateway-controller` | Every GatewayClass with this `controllerName` is served |
@@ -73,7 +73,8 @@ defaults that a GatewayClass can override.
 A GatewayClass may point `spec.parametersRef` at a ConfigMap (group `""`,
 kind `ConfigMap`, with a namespace) with any of `tags`, `replicas`, `image`
 and `drainGracePeriod`. Invalid values set `Accepted=False` with reason
-`InvalidParameters` on the class, and its Gateways are not programmed. See
+`InvalidParameters` on the class, and its Gateways stop serving until the
+class is valid again. See
 `examples/classes.yaml`. Tags are under the class owner's control: Gateways
 cannot override them.
 
