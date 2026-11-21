@@ -15,6 +15,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -153,6 +154,8 @@ func startEnv(t *testing.T, withManager bool) *env {
 	if withManager {
 		must(NewGatewayClassReconciler(c, cfg, rec).SetupWithManager(mgr))
 		must(NewGatewayReconciler(c, scheme, cfg, ts, AllFeatures(), rec).SetupWithManager(mgr))
+		must(NewIngressReconciler(c, scheme, cfg, rec).SetupWithManager(mgr))
+		must(NewServiceReconciler(c, scheme, cfg, AllFeatures(), rec).SetupWithManager(mgr))
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -446,6 +449,158 @@ func TestEnvtestGatewayLifecycle(t *testing.T) {
 	})
 }
 
+func TestEnvtestIngressAndService(t *testing.T) {
+	e := startEnv(t, true)
+	e.create(namespace("apps"),
+		&gwv1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "tailnet"}, Spec: gwv1.GatewayClassSpec{ControllerName: gwv1.GatewayController(config.DefaultControllerName)}},
+		&networkingv1.IngressClass{ObjectMeta: metav1.ObjectMeta{Name: "tailnet"}, Spec: networkingv1.IngressClassSpec{Controller: config.IngressControllerName}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "web"},
+			Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "http", Port: 8080}}}},
+	)
+	prefix := networkingv1.PathTypePrefix
+	ing := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "site"},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: ptr.To("tailnet"),
+			TLS:              []networkingv1.IngressTLS{{Hosts: []string{"site"}}},
+			Rules: []networkingv1.IngressRule{{Host: "site", IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+				Paths: []networkingv1.HTTPIngressPath{{Path: "/", PathType: &prefix, Backend: networkingv1.IngressBackend{
+					Service: &networkingv1.IngressServiceBackend{Name: "web", Port: networkingv1.ServiceBackendPort{Name: "http"}},
+				}}},
+			}}}},
+		},
+	}
+	e.create(ing)
+	e.eventually("ingress translated", func() error {
+		g := &gwv1.Gateway{}
+		if err := e.get("apps", "site", g); err != nil {
+			return err
+		}
+		if l := g.Spec.Listeners; len(l) != 1 || l[0].Protocol != gwv1.HTTPSProtocolType || l[0].Port != 443 {
+			return fmt.Errorf("listeners = %+v", l)
+		}
+		r := &gwv1.HTTPRoute{}
+		if err := e.get("apps", "site", r); err != nil {
+			return err
+		}
+		if p := r.Spec.Rules[0].BackendRefs[0].Port; p == nil || *p != 8080 {
+			return fmt.Errorf("named port not resolved: %v", p)
+		}
+		return nil
+	})
+
+	// The default backend takes the paths and hosts that no rule matches.
+	backend := networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{Name: "web", Port: networkingv1.ServiceBackendPort{Number: 8080}}}
+	e.create(&networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "fallback"},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: ptr.To("tailnet"),
+			DefaultBackend:   &backend,
+			Rules: []networkingv1.IngressRule{{Host: "app", IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+				Paths: []networkingv1.HTTPIngressPath{{Path: "/api", PathType: &prefix, Backend: backend}},
+			}}}},
+		},
+	})
+	e.eventually("default backend added", func() error {
+		host, other := &gwv1.HTTPRoute{}, &gwv1.HTTPRoute{}
+		if err := e.get("apps", "fallback-0", host); err != nil {
+			return err
+		}
+		if err := e.get("apps", "fallback-1", other); err != nil {
+			return err
+		}
+		if len(host.Spec.Rules) != 2 || *host.Spec.Rules[1].Matches[0].Path.Value != "/" {
+			return fmt.Errorf("host rules = %+v", host.Spec.Rules)
+		}
+		if len(other.Spec.Hostnames) != 0 || len(other.Spec.Rules) != 1 {
+			return fmt.Errorf("catch-all route = %+v", other.Spec)
+		}
+		return nil
+	})
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "db", Annotations: map[string]string{config.AnnotationHostname: "db"}},
+		Spec: corev1.ServiceSpec{
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: ptr.To("tailnet"),
+			Ports: []corev1.ServicePort{
+				{Name: "ui", Port: 80, AppProtocol: ptr.To("http")},
+				{Name: "pg", Port: 5432},
+				{Name: "dns", Port: 53, Protocol: corev1.ProtocolUDP},
+			},
+		},
+	}
+	e.create(svc)
+	e.eventually("service translated", func() error {
+		g := &gwv1.Gateway{}
+		if err := e.get("apps", "db", g); err != nil {
+			return err
+		}
+		var names []string
+		for _, l := range g.Spec.Listeners {
+			names = append(names, string(l.Name))
+		}
+		if strings.Join(names, ",") != "http-80,tcp-5432" {
+			return fmt.Errorf("listeners = %v", names)
+		}
+		if err := e.get("apps", "db-http-80", &gwv1.HTTPRoute{}); err != nil {
+			return err
+		}
+		tr := &gwv1.TCPRoute{}
+		if err := e.get("apps", "db-tcp-5432", tr); err != nil {
+			return err
+		}
+		if tr.Annotations[config.AnnotationTailscaleService] != "db" {
+			return fmt.Errorf("annotations = %v", tr.Annotations)
+		}
+		s := &corev1.Service{}
+		if err := e.get("apps", "db", s); err != nil {
+			return err
+		}
+		if len(s.Finalizers) != 1 {
+			return fmt.Errorf("finalizers = %v", s.Finalizers)
+		}
+		return nil
+	})
+
+	// Removing a port prunes its route.
+	s := &corev1.Service{}
+	_ = e.get("apps", "db", s)
+	s.Spec.Ports = s.Spec.Ports[:1]
+	if err := e.c.Update(e.ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	e.eventually("tcp route pruned", func() error {
+		if err := e.get("apps", "db-tcp-5432", &gwv1.TCPRoute{}); !apierrors.IsNotFound(err) {
+			return fmt.Errorf("still there: %v", err)
+		}
+		return nil
+	})
+
+	// Changing the class away from ours cleans up and drops the finalizer.
+	_ = e.get("apps", "db", s)
+	s.Spec.Type = corev1.ServiceTypeClusterIP
+	s.Spec.LoadBalancerClass = nil
+	if err := e.c.Update(e.ctx, s); err != nil {
+		t.Fatal(err)
+	}
+	e.eventually("service released", func() error {
+		s := &corev1.Service{}
+		if err := e.get("apps", "db", s); err != nil {
+			return err
+		}
+		if len(s.Finalizers) != 0 {
+			return fmt.Errorf("finalizers = %v", s.Finalizers)
+		}
+		if err := e.get("apps", "db", &gwv1.Gateway{}); !apierrors.IsNotFound(err) {
+			return fmt.Errorf("gateway still there: %v", err)
+		}
+		return nil
+	})
+}
+
+// TestEnvtestManualKeyMode drives the reconciler by hand, without a
+// manager, so that each step is deterministic.
 func TestEnvtestManualKeyMode(t *testing.T) {
 	e := startEnv(t, false)
 	cfg := *e.cfg
@@ -536,7 +691,8 @@ func (e *env) serveConfig(ns, name string) (serveconf.Config, error) {
 }
 
 // TestEnvtestOwnership covers objects and names that belong to someone
-// else: existing objects and Tailscale Service names of other Gateways.
+// else: existing objects, Tailscale Service names of other Gateways, and
+// IngressClasses of other controllers.
 func TestEnvtestOwnership(t *testing.T) {
 	e := startEnv(t, true)
 	e.cfg.TailnetDomain = "tail1234.ts.net" // set before any object exists
@@ -624,6 +780,32 @@ func TestEnvtestOwnership(t *testing.T) {
 			return fmt.Errorf("services = %v", sc.ServiceNames())
 		}
 		return nil
+	})
+
+	// An IngressClass of another controller is not served, even under the
+	// configured name.
+	e.create(
+		&networkingv1.IngressClass{ObjectMeta: metav1.ObjectMeta{Name: "tailnet"}, Spec: networkingv1.IngressClassSpec{Controller: "example.com/other"}},
+		&networkingv1.Ingress{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "one", Name: "foreign"},
+			Spec: networkingv1.IngressSpec{IngressClassName: ptr.To("tailnet"), DefaultBackend: &networkingv1.IngressBackend{
+				Service: &networkingv1.IngressServiceBackend{Name: "web", Port: networkingv1.ServiceBackendPort{Number: 80}}}},
+		})
+	time.Sleep(2 * time.Second)
+	if err := e.get("one", "foreign", &gwv1.Gateway{}); !apierrors.IsNotFound(err) {
+		t.Errorf("Ingress of another controller was translated: %v", err)
+	}
+
+	// A LoadBalancer Service waits for its GatewayClass.
+	e.create(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "two", Name: "late", Annotations: map[string]string{config.AnnotationGatewayClass: "late"}},
+		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer, LoadBalancerClass: ptr.To("tailnet"),
+			Ports: []corev1.ServicePort{{Name: "pg", Port: 5432}}},
+	})
+	time.Sleep(time.Second)
+	e.create(&gwv1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "late"}, Spec: gwv1.GatewayClassSpec{ControllerName: gwv1.GatewayController(config.DefaultControllerName)}})
+	e.eventually("service exposed once its class exists", func() error {
+		return e.get("two", "late", &gwv1.Gateway{})
 	})
 }
 
