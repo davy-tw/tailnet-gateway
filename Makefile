@@ -1,4 +1,4 @@
-IMG ?= ghcr.io/davy-tw/tailnet-gateway:latest
+IMG ?= ghcr.io/davy-tw/tailnet-gateway/controller:latest
 ENVTEST_K8S_VERSION ?= 1.37.0
 ENVTEST_DIR ?= $(CURDIR)/bin/envtest
 KUSTOMIZE ?= go run sigs.k8s.io/kustomize/kustomize/v5@v5.7.1
@@ -41,7 +41,7 @@ K3D_CLUSTER ?= tailnet-gateway-e2e
 # source has no default and falls back to an old one).
 K3S_IMAGE ?= rancher/k3s:v1.37.2-k3s1
 GATEWAY_API_VERSION ?= v1.6.3
-E2E_IMG ?= ghcr.io/davy-tw/tailnet-gateway:e2e
+E2E_IMG ?= ghcr.io/davy-tw/tailnet-gateway/controller:e2e
 E2E_ENV = E2E_AUTHKEY=tskey-auth-e2e-not-a-real-key
 
 e2e-kind:

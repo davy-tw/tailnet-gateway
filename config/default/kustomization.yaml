@@ -7,5 +7,5 @@ resources:
   - ../classes
 images:
   - name: tailnet-gateway
-    newName: ghcr.io/davy-tw/tailnet-gateway
+    newName: ghcr.io/davy-tw/tailnet-gateway/controller
     newTag: latest

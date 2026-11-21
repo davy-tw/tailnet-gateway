@@ -269,7 +269,7 @@ spec:
         - secretRef:
             name: tailnet-gateway
             optional: true
-        image: ghcr.io/davy-tw/tailnet-gateway:latest
+        image: ghcr.io/davy-tw/tailnet-gateway/controller:latest
         livenessProbe:
           httpGet:
             path: /healthz
