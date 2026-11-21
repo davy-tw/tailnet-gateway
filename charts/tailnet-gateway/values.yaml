@@ -1,0 +1,90 @@
+# The Gateway API CRDs (v1.6.0 or newer, Standard channel) must be installed
+# before the controller; this chart does not install them.
+
+image:
+  repository: ghcr.io/davy-tw/tailnet-gateway
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# More than one replica only adds standbys: leader election keeps one active.
+replicaCount: 1
+
+# Tailscale OAuth client used to mint auth keys and delete devices. Without
+# one the controller runs in manual key mode (see docs/setup.md).
+oauth:
+  # Name of an existing Secret with TAILSCALE_OAUTH_CLIENT_ID and
+  # TAILSCALE_OAUTH_CLIENT_SECRET. It is loaded as environment variables;
+  # settings below that are set take precedence over the same names in it.
+  # Takes precedence over clientId/clientSecret.
+  existingSecret: ""
+  # Set both to have the chart create the Secret. Prefer existingSecret so
+  # the credentials stay out of Helm values.
+  clientId: ""
+  clientSecret: ""
+
+controller:
+  # GatewayClass spec.controllerName this controller serves.
+  name: tailnet-gateway.davy.tw/gateway-controller
+  # GatewayClass used for Ingresses and LoadBalancer Services.
+  defaultGatewayClass: tailnet
+  # IngressClass name served.
+  ingressClass: tailnet
+  # spec.loadBalancerClass served.
+  loadBalancerClass: tailnet
+  # Description put on minted auth keys.
+  authKeyDescription: ""
+  # Tailnet MagicDNS suffix (for example tail1234.ts.net). Learned from the
+  # first proxy replica when empty.
+  tailnetDomain: ""
+  # Cluster DNS domain used for backend Service hostnames.
+  clusterDomain: ""
+  # Tailscale API base URL.
+  tailscaleApiUrl: ""
+
+# Defaults for the proxies; a GatewayClass parametersRef can override them.
+proxy:
+  # Comma-separated tags requested on minted keys (for example tag:k8s).
+  tags: ""
+  replicas: ""
+  image: ""
+  drainGracePeriod: ""
+
+# Classes installed with the chart.
+gatewayClass:
+  create: true
+  name: tailnet
+  # A ConfigMap parametersRef ({namespace, name}) for the class.
+  parametersRef: {}
+ingressClass:
+  create: true
+  # Make it the cluster's default IngressClass.
+  default: false
+
+# Additional environment variables for the controller.
+extraEnv: []
+
+serviceAccount:
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+metrics:
+  service:
+    enabled: true
+    port: 8080

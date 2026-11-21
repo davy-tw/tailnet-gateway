@@ -1,0 +1,12 @@
+apiVersion: v2
+name: tailnet-gateway
+description: Exposes Gateway API Gateways, Ingresses and LoadBalancer Services to a tailnet as Tailscale Services.
+type: application
+# Released charts get the tag's version for both fields (see .github/workflows/release.yaml).
+version: 0.0.0-dev
+appVersion: latest
+home: https://github.com/davy-tw/tailnet-gateway
+sources:
+  - https://github.com/davy-tw/tailnet-gateway
+license: MIT-0 OR Apache-2.0
+keywords: [tailscale, gateway-api, ingress, controller]

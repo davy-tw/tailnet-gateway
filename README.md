@@ -42,6 +42,26 @@ kubectl -n tailnet-gateway-system rollout restart deployment/tailnet-gateway
 kubectl apply -f examples/demo.yaml
 ```
 
+### With Helm
+
+Released charts are published to GHCR as OCI artifacts:
+
+```sh
+kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
+kubectl create namespace tailnet-gateway-system
+kubectl -n tailnet-gateway-system create secret generic tailnet-gateway \
+  --from-literal=TAILSCALE_OAUTH_CLIENT_ID=... --from-literal=TAILSCALE_OAUTH_CLIENT_SECRET=...
+helm install tailnet-gateway oci://ghcr.io/davy-tw/charts/tailnet-gateway \
+  --version <version> --namespace tailnet-gateway-system \
+  --set oauth.existingSecret=tailnet-gateway --set proxy.tags=tag:k8s
+```
+
+Every setting in [Configuration](#configuration) has a value in
+[`charts/tailnet-gateway/values.yaml`](charts/tailnet-gateway/values.yaml). The
+chart also installs the `tailnet` GatewayClass and IngressClass
+(`gatewayClass.create`, `ingressClass.create`, `ingressClass.default`). It
+does not install the Gateway API CRDs.
+
 Then define `svc:demo` in your tailnet and let it auto-approve the proxies'
 tag; see [docs/setup.md](docs/setup.md). Once a replica is up, the Gateway
 reports `Programmed=True` and its address `demo.<tailnet>.ts.net`.
@@ -146,11 +166,12 @@ make test          # unit tests
 make test-envtest  # unit + integration tests against kube-apiserver/etcd
 make e2e           # against the current kubeconfig context (build tag e2e)
 make manifests     # regenerate dist/install.yaml
+make chart-lint chart-render  # lint and render the Helm chart to bin/chart.yaml
 ```
 
-[`docs/design.md`](docs/design.md) describes the design and its decisions.
-[`docs/spike-findings.md`](docs/spike-findings.md) records the prototype that validated direct proxying
-to cluster DNS names and gRPC through Tailscale Services.
+With `CHART_MANIFESTS=$PWD/bin/chart.yaml`, `make test-envtest` also checks
+that the rendered chart validates against the API server and grants the same
+RBAC as `dist/install.yaml`.
 
 ## License
 

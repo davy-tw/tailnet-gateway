@@ -2,8 +2,10 @@ IMG ?= ghcr.io/davy-tw/tailnet-gateway:latest
 ENVTEST_K8S_VERSION ?= 1.37.0
 ENVTEST_DIR ?= $(CURDIR)/bin/envtest
 KUSTOMIZE ?= go run sigs.k8s.io/kustomize/kustomize/v5@v5.7.1
+HELM ?= helm
+CHART ?= charts/tailnet-gateway
 
-.PHONY: build test test-envtest e2e vet manifests docker-build
+.PHONY: build test test-envtest e2e vet manifests docker-build chart-lint chart-render
 
 build:
 	go build -o bin/manager ./cmd/manager
@@ -30,3 +32,14 @@ manifests:
 
 docker-build:
 	docker build -t $(IMG) .
+
+chart-lint:
+	$(HELM) lint $(CHART)
+
+# Renders the chart with every optional object enabled, for the tests in
+# internal/controller/chart_test.go (CHART_MANIFESTS=$(CURDIR)/bin/chart.yaml).
+chart-render:
+	mkdir -p bin
+	$(HELM) template tailnet-gateway $(CHART) --namespace tailnet-gateway-system \
+		--set oauth.clientId=id --set oauth.clientSecret=secret --set proxy.tags=tag:k8s \
+		--set ingressClass.default=true > bin/chart.yaml

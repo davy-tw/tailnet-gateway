@@ -1,0 +1,10 @@
+tailnet-gateway {{ .Values.image.tag | default .Chart.AppVersion }} is installed in {{ .Release.Namespace }}.
+{{- if not (or .Values.oauth.existingSecret .Values.oauth.clientId) }}
+
+No OAuth client is configured, so the controller runs in manual key mode
+unless the Secret {{ include "tailnet-gateway.fullname" . }} provides one. See docs/setup.md.
+{{- end }}
+
+Expose something on the tailnet with a Gateway of class {{ .Values.gatewayClass.name }},
+an Ingress of class {{ .Values.controller.ingressClass }}, or a Service with
+type LoadBalancer and loadBalancerClass {{ .Values.controller.loadBalancerClass }}.

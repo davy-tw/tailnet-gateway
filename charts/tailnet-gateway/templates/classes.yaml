@@ -1,0 +1,33 @@
+{{- if .Values.gatewayClass.create }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: {{ .Values.gatewayClass.name }}
+  labels:
+    {{- include "tailnet-gateway.labels" . | nindent 4 }}
+spec:
+  controllerName: {{ .Values.controller.name }}
+  description: Exposes Gateways to the tailnet as Tailscale Services.
+  {{- with .Values.gatewayClass.parametersRef }}
+  parametersRef:
+    group: ""
+    kind: ConfigMap
+    namespace: {{ required "gatewayClass.parametersRef.namespace is required" .namespace }}
+    name: {{ required "gatewayClass.parametersRef.name is required" .name }}
+  {{- end }}
+{{- end }}
+{{- if .Values.ingressClass.create }}
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: {{ .Values.controller.ingressClass }}
+  labels:
+    {{- include "tailnet-gateway.labels" . | nindent 4 }}
+  {{- if .Values.ingressClass.default }}
+  annotations:
+    ingressclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+spec:
+  controller: tailnet-gateway.davy.tw/ingress-controller
+{{- end }}

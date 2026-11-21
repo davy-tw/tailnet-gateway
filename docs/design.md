@@ -462,7 +462,9 @@ as the same devices when the class is recreated.
 
 - Metrics and liveness and readiness probes on the configured addresses.
 - Install bundle: namespace, Deployment, ServiceAccount, RBAC, metrics
-  Service, and the `tailnet` GatewayClass and IngressClass. A demo Gateway
+  Service, and the `tailnet` GatewayClass and IngressClass. The same objects
+  are also packaged as a Helm chart, published with the image to GHCR on
+  each release tag. A demo Gateway
   and HTTPRoute split `/api` and `/` across two backends for smoke tests.
 - Integration tests run against a real API server (envtest). End-to-end
   tests run against a real cluster behind a build tag, so unit-test CI does
