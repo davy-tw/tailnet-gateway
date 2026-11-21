@@ -5,7 +5,7 @@ A Kubernetes controller that exposes in-cluster workloads to your
 **Tailscale Services**, through three front doors:
 
 1. Gateway API `Gateway`s of a managed GatewayClass (HTTPRoute, GRPCRoute,
-   TLSRoute, TCPRoute)
+   TLSRoute, TCPRoute), with listeners added by ListenerSets
 2. `Ingress`es of the `tailnet` IngressClass
 3. `Service`s of `type: LoadBalancer` with `loadBalancerClass: tailnet`
 
@@ -127,6 +127,7 @@ silently dropping it.
 | Cross-namespace backends | With a ReferenceGrant |
 | `allowedRoutes` (namespaces and kinds), `sectionName`, `port`, hostname intersection | Yes |
 | BackendTLSPolicy | Upgrades the backend hop to verified TLS. Only `wellKnownCACertificates: System` with a `hostname` equal to the backend's cluster FQDN can be honored; other policies are `Accepted=False` and their backend is not used |
+| ListenerSet | Yes, when the Gateway's `allowedListeners` allows it (none by default). Its listeners are served by the Gateway's proxy; routes attach with a `ListenerSet` parentRef. A listener that conflicts with the Gateway's or an older ListenerSet's is not accepted ([example](examples/listenerset.yaml)) |
 | Route conflicts | Oldest route wins a path or port; newer routes report `Conflicted` |
 | Tailscale Service names across Gateways | A name belongs to the oldest Gateway serving it; routes of newer Gateways report `Conflicted` |
 

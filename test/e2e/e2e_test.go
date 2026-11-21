@@ -259,6 +259,78 @@ func TestGatewaySmoke(t *testing.T) {
 	})
 }
 
+// TestListenerSet attaches a ListenerSet to a Gateway that allows
+// ListenerSets from its own namespace, routes through it, and checks that
+// its listener is served by the Gateway's proxy.
+func TestListenerSet(t *testing.T) {
+	s := setup(t, "tailnet-e2e-ls")
+	class := env("E2E_GATEWAY_CLASS", "tailnet")
+	svcLabel := s.ns
+	gw := httpGateway(s.ns, "shared", class)
+	gw.Spec.AllowedListeners = &gwv1.AllowedListeners{Namespaces: &gwv1.ListenerNamespaces{From: ptr.To(gwv1.NamespacesFromSame)}}
+	s.authKey("shared")
+	s.create(backend(s.ns), gw,
+		&gwv1.ListenerSet{ObjectMeta: metav1.ObjectMeta{Namespace: s.ns, Name: "apps"},
+			Spec: gwv1.ListenerSetSpec{
+				ParentRef: gwv1.ParentGatewayReference{Name: "shared"},
+				Listeners: []gwv1.ListenerEntry{{Name: "web", Protocol: gwv1.HTTPProtocolType, Port: 8080}},
+			}},
+		&gwv1.HTTPRoute{ObjectMeta: metav1.ObjectMeta{Namespace: s.ns, Name: "via-set"},
+			Spec: gwv1.HTTPRouteSpec{
+				CommonRouteSpec: gwv1.CommonRouteSpec{ParentRefs: []gwv1.ParentReference{
+					{Kind: ptr.To(gwv1.Kind("ListenerSet")), Name: "apps", SectionName: ptr.To(gwv1.SectionName("web"))}}},
+				Hostnames: []gwv1.Hostname{gwv1.Hostname(svcLabel)},
+				Rules: []gwv1.HTTPRouteRule{{BackendRefs: []gwv1.HTTPBackendRef{{BackendRef: gwv1.BackendRef{
+					BackendObjectReference: gwv1.BackendObjectReference{Name: "web", Port: ptr.To(gwv1.PortNumber(80))}}}}}},
+			}})
+
+	s.wait("Gateway accepted", time.Minute, s.gatewayAccepted("shared"))
+	s.wait("ListenerSet accepted", time.Minute, func() error {
+		ls := &gwv1.ListenerSet{}
+		if err := s.c.Get(s.ctx, s.key("apps"), ls); err != nil {
+			return err
+		}
+		if err := condTrue(ls.Status.Conditions, "Accepted"); err != nil {
+			return err
+		}
+		if len(ls.Status.Listeners) != 1 || ls.Status.Listeners[0].AttachedRoutes != 1 {
+			return fmt.Errorf("listeners = %+v", ls.Status.Listeners)
+		}
+		return nil
+	})
+	s.wait("ListenerSet counted on the Gateway", time.Minute, func() error {
+		gw := &gwv1.Gateway{}
+		if err := s.c.Get(s.ctx, s.key("shared"), gw); err != nil {
+			return err
+		}
+		if n := ptr.Deref(gw.Status.AttachedListenerSets, -1); n != 1 {
+			return fmt.Errorf("attachedListenerSets = %d", n)
+		}
+		return nil
+	})
+	s.wait("HTTPRoute accepted by the ListenerSet", time.Minute, func() error {
+		r := &gwv1.HTTPRoute{}
+		if err := s.c.Get(s.ctx, s.key("via-set"), r); err != nil {
+			return err
+		}
+		if len(r.Status.Parents) != 1 || r.Status.Parents[0].ParentRef.Kind == nil || *r.Status.Parents[0].ParentRef.Kind != "ListenerSet" {
+			return fmt.Errorf("parents = %+v", r.Status.Parents)
+		}
+		return condTrue(r.Status.Parents[0].Conditions, "Accepted")
+	})
+	s.wait("served by the Gateway's proxy", time.Minute, func() error {
+		cm := &corev1.ConfigMap{}
+		if err := s.c.Get(s.ctx, s.key("shared"), cm); err != nil {
+			return err
+		}
+		if got := cm.Annotations["tailnet-gateway.davy.tw/tailscale-services"]; got != svcLabel {
+			return fmt.Errorf("services annotation = %q", got)
+		}
+		return nil
+	})
+	s.wait("proxy started", 3*time.Minute, s.proxyStarted("shared"))
+}
+
 // TestDeletion deletes a Gateway whose proxy runs, in the foreground, and
 // checks that the controller's finalizer and garbage collection remove
 // everything, and that its GatewayClass is kept until then.

@@ -17,6 +17,7 @@ rules:
       - udproutes
       - referencegrants
       - backendtlspolicies
+      - listenersets
     verbs: [get, list, watch, create, update, patch, delete]
   - apiGroups: [gateway.networking.k8s.io]
     resources:
@@ -28,6 +29,7 @@ rules:
       - tcproutes/status
       - udproutes/status
       - backendtlspolicies/status
+      - listenersets/status
     verbs: [get, update, patch]
   - apiGroups: [networking.k8s.io]
     resources: [ingresses]

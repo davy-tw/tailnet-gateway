@@ -74,7 +74,7 @@ e2e-install:
 		--set image.pullPolicy=Never --set proxy.drainGracePeriod=5s --wait --timeout 5m
 
 e2e-diagnostics:
-	-kubectl get gatewayclasses,gateways,httproutes,tcproutes,ingresses,statefulsets,pods -A -o wide
+	-kubectl get gatewayclasses,gateways,listenersets,httproutes,tcproutes,ingresses,statefulsets,pods -A -o wide
 	-kubectl -n tailnet-gateway-system describe pods
 	-kubectl -n tailnet-gateway-system logs deployment/tailnet-gateway --all-containers --tail=300
 	-kubectl get events -A --sort-by=.lastTimestamp | tail -80
