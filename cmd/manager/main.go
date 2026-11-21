@@ -2,8 +2,10 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
+	"net/http"
 	"os"
 	"time"
 
@@ -50,6 +52,9 @@ func main() {
 		os.Exit(1)
 	}
 	// Wait (without crash-looping) until the Gateway API CRDs are installed.
+	// Meanwhile the probe address answers /healthz, so that the liveness
+	// probe does not restart the container, and fails /readyz.
+	waitProbes := startWaitingProbes(cfg.ProbeAddr)
 	var features controller.Features
 	for {
 		features, err = controller.DetectFeatures(dc)
@@ -63,6 +68,9 @@ func main() {
 			setupLog.Error(err, "discovering Gateway API; retrying in 30s")
 		}
 		time.Sleep(30 * time.Second)
+	}
+	if err := waitProbes.Shutdown(context.Background()); err != nil {
+		setupLog.Error(err, "stopping the startup probe server")
 	}
 	for kind, on := range map[string]bool{
 		"GRPCRoute": features.GRPCRoute, "TLSRoute": features.TLSRoute, "TCPRoute": features.TCPRoute,
@@ -128,4 +136,21 @@ func main() {
 		setupLog.Error(err, "manager exited")
 		os.Exit(1)
 	}
+}
+
+// startWaitingProbes serves the health probes until the manager, which
+// serves them afterwards, starts.
+func startWaitingProbes(addr string) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "waiting for the Gateway API CRDs", http.StatusServiceUnavailable)
+	})
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			ctrl.Log.WithName("setup").Error(err, "startup probe server")
+		}
+	}()
+	return srv
 }

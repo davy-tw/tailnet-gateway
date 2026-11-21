@@ -26,16 +26,25 @@ func TestPlanService(t *testing.T) {
 
 	svc.Annotations = map[string]string{config.AnnotationHostname: "web"}
 	plan = PlanService(svc)
-	if plan.HTTP == nil || plan.HTTP.Port != 80 || plan.HTTPS || plan.Label != "web" {
+	if plan.HTTP == nil || plan.HTTP.Port != 80 || plan.Label != "web" {
 		t.Errorf("http port: %+v", plan)
 	}
-	if len(plan.TCP) != 1 || plan.TCP[0].Port != 22 {
-		t.Errorf("tcp ports: %+v (8080 is HTTP-ish and consumed)", plan.TCP)
+	if len(plan.TCP) != 2 || plan.TCP[0].Port != 22 || plan.TCP[1].Port != 8080 {
+		t.Errorf("tcp ports: %+v (only the selected HTTP port leaves the TCP forwards)", plan.TCP)
 	}
 
-	svc.Spec.Ports = []corev1.ServicePort{{Name: "a", Port: 8443, AppProtocol: ptr.To("https")}}
-	if plan = PlanService(svc); plan.HTTP == nil || !plan.HTTPS {
-		t.Errorf("https: %+v", plan)
+	// TLS and h2c backends are forwarded as raw TCP, never served as HTTP.
+	svc.Spec.Ports = []corev1.ServicePort{
+		{Name: "tls", Port: 8443, AppProtocol: ptr.To("https")},
+		{Name: "grpc", Port: 9090, AppProtocol: ptr.To("kubernetes.io/h2c")},
+		{Name: "plain", Port: 3000},
+	}
+	if plan = PlanService(svc); plan.HTTP == nil || plan.HTTP.Port != 3000 || len(plan.TCP) != 2 {
+		t.Errorf("raw protocols: %+v", plan)
+	}
+	svc.Spec.Ports = svc.Spec.Ports[:2]
+	if plan = PlanService(svc); plan.HTTP != nil || len(plan.TCP) != 2 {
+		t.Errorf("only raw protocols: %+v", plan)
 	}
 
 	svc.Spec.Ports = []corev1.ServicePort{{Name: "a", Port: 3000}, {Name: "b", Port: 22}}

@@ -37,6 +37,7 @@ import (
 	"go.pkgs.davy.tw/tailnet-gateway/internal/proxy"
 	"go.pkgs.davy.tw/tailnet-gateway/internal/serveconf"
 	"go.pkgs.davy.tw/tailnet-gateway/internal/tailscale"
+	"go.pkgs.davy.tw/tailnet-gateway/internal/translate"
 )
 
 // fakeTS is an in-memory Tailscale API.
@@ -480,6 +481,35 @@ func TestEnvtestIngressAndService(t *testing.T) {
 		return nil
 	})
 
+	// The default backend takes the paths and hosts that no rule matches.
+	backend := networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{Name: "web", Port: networkingv1.ServiceBackendPort{Number: 8080}}}
+	e.create(&networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "fallback"},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: ptr.To("tailnet"),
+			DefaultBackend:   &backend,
+			Rules: []networkingv1.IngressRule{{Host: "app", IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+				Paths: []networkingv1.HTTPIngressPath{{Path: "/api", PathType: &prefix, Backend: backend}},
+			}}}},
+		},
+	})
+	e.eventually("default backend added", func() error {
+		host, other := &gwv1.HTTPRoute{}, &gwv1.HTTPRoute{}
+		if err := e.get("apps", "fallback-0", host); err != nil {
+			return err
+		}
+		if err := e.get("apps", "fallback-1", other); err != nil {
+			return err
+		}
+		if len(host.Spec.Rules) != 2 || *host.Spec.Rules[1].Matches[0].Path.Value != "/" {
+			return fmt.Errorf("host rules = %+v", host.Spec.Rules)
+		}
+		if len(other.Spec.Hostnames) != 0 || len(other.Spec.Rules) != 1 {
+			return fmt.Errorf("catch-all route = %+v", other.Spec)
+		}
+		return nil
+	})
+
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "db", Annotations: map[string]string{config.AnnotationHostname: "db"}},
 		Spec: corev1.ServiceSpec{
@@ -618,4 +648,146 @@ func TestEnvtestManualKeyMode(t *testing.T) {
 	if string(s.Data["authkey"]) != "tskey-auth-user" {
 		t.Errorf("authkey was overwritten: %q", s.Data["authkey"])
 	}
+}
+
+func httpGateway(ns, name string) *gwv1.Gateway {
+	return &gwv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		Spec: gwv1.GatewaySpec{GatewayClassName: "tailnet", Listeners: []gwv1.Listener{
+			{Name: "http", Protocol: gwv1.HTTPProtocolType, Port: 80, AllowedRoutes: &gwv1.AllowedRoutes{
+				Namespaces: &gwv1.RouteNamespaces{From: ptr.To(gwv1.NamespacesFromSame)}}},
+		}},
+	}
+}
+
+func hostRoute(ns, name, gateway, host, backend string) *gwv1.HTTPRoute {
+	return &gwv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		Spec: gwv1.HTTPRouteSpec{
+			CommonRouteSpec: gwv1.CommonRouteSpec{ParentRefs: []gwv1.ParentReference{{Name: gwv1.ObjectName(gateway)}}},
+			Hostnames:       []gwv1.Hostname{gwv1.Hostname(host)},
+			Rules: []gwv1.HTTPRouteRule{{BackendRefs: []gwv1.HTTPBackendRef{{BackendRef: gwv1.BackendRef{
+				BackendObjectReference: gwv1.BackendObjectReference{Name: gwv1.ObjectName(backend), Port: ptr.To(gwv1.PortNumber(80))}}}}}},
+		},
+	}
+}
+
+func (e *env) serveConfig(ns, name string) (serveconf.Config, error) {
+	var sc serveconf.Config
+	cm := &corev1.ConfigMap{}
+	if err := e.get(ns, name, cm); err != nil {
+		return sc, err
+	}
+	err := json.Unmarshal([]byte(cm.Data[proxy.ServeConfigKey]), &sc)
+	return sc, err
+}
+
+// TestEnvtestOwnership covers objects and names that belong to someone
+// else: existing objects, Tailscale Service names of other Gateways, and
+// IngressClasses of other controllers.
+func TestEnvtestOwnership(t *testing.T) {
+	e := startEnv(t, true)
+	e.cfg.TailnetDomain = "tail1234.ts.net" // set before any object exists
+	e.create(namespace("one"), namespace("two"),
+		&gwv1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "tailnet"}, Spec: gwv1.GatewayClassSpec{ControllerName: gwv1.GatewayController(config.DefaultControllerName)}},
+		backendService("one", "web", 80), backendService("two", "web", 80),
+		// Not created by the controller: must not be taken over.
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Namespace: "one", Name: "taken"}},
+	)
+
+	e.create(httpGateway("one", "taken"))
+	e.eventually("existing object reported", func() error {
+		g := &gwv1.Gateway{}
+		if err := e.get("one", "taken", g); err != nil {
+			return err
+		}
+		c := meta.FindStatusCondition(g.Status.Conditions, "Programmed")
+		if c == nil || c.Status != metav1.ConditionFalse || !strings.Contains(c.Message, "ServiceAccount one/taken exists and is not owned") {
+			return fmt.Errorf("programmed = %+v", c)
+		}
+		return nil
+	})
+	sa := &corev1.ServiceAccount{}
+	_ = e.get("one", "taken", sa)
+	if len(sa.OwnerReferences) != 0 {
+		t.Errorf("ServiceAccount was taken over: %+v", sa.OwnerReferences)
+	}
+
+	// The older Gateway keeps a Tailscale Service name.
+	e.create(httpGateway("one", "first"), hostRoute("one", "r", "first", "shared", "web"))
+	e.eventually("first serves svc:shared", func() error {
+		sc, err := e.serveConfig("one", "first")
+		if err != nil {
+			return err
+		}
+		if _, ok := sc.Services["svc:shared"]; !ok {
+			return fmt.Errorf("services = %v", sc.ServiceNames())
+		}
+		return nil
+	})
+	time.Sleep(1100 * time.Millisecond) // creation timestamps have second precision
+	e.create(httpGateway("two", "second"), hostRoute("two", "r", "second", "shared", "web"))
+	e.eventually("second reports the conflict", func() error {
+		r := &gwv1.HTTPRoute{}
+		if err := e.get("two", "r", r); err != nil {
+			return err
+		}
+		if len(r.Status.Parents) == 0 {
+			return fmt.Errorf("no parent status")
+		}
+		c := meta.FindStatusCondition(r.Status.Parents[0].Conditions, "Accepted")
+		if c == nil || c.Reason != translate.ReasonConflicted || !strings.Contains(c.Message, "one/first") {
+			return fmt.Errorf("accepted = %+v", c)
+		}
+		sc, err := e.serveConfig("two", "second")
+		if err != nil {
+			return err
+		}
+		if len(sc.Services) != 0 {
+			return fmt.Errorf("second serves %v", sc.ServiceNames())
+		}
+		return nil
+	})
+	// Once the first Gateway is gone, the name moves to the second.
+	if err := e.c.Delete(e.ctx, &gwv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: "one", Name: "first"}}); err != nil {
+		t.Fatal(err)
+	}
+	e.eventually("second takes svc:shared over", func() error {
+		// envtest runs no garbage collector: remove the owned ConfigMap.
+		_ = e.c.Delete(e.ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "one", Name: "first"}})
+		sc, err := e.serveConfig("two", "second")
+		if err != nil {
+			return err
+		}
+		if _, ok := sc.Services["svc:shared"]; !ok {
+			return fmt.Errorf("services = %v", sc.ServiceNames())
+		}
+		return nil
+	})
+
+	// An IngressClass of another controller is not served, even under the
+	// configured name.
+	e.create(
+		&networkingv1.IngressClass{ObjectMeta: metav1.ObjectMeta{Name: "tailnet"}, Spec: networkingv1.IngressClassSpec{Controller: "example.com/other"}},
+		&networkingv1.Ingress{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "one", Name: "foreign"},
+			Spec: networkingv1.IngressSpec{IngressClassName: ptr.To("tailnet"), DefaultBackend: &networkingv1.IngressBackend{
+				Service: &networkingv1.IngressServiceBackend{Name: "web", Port: networkingv1.ServiceBackendPort{Number: 80}}}},
+		})
+	time.Sleep(2 * time.Second)
+	if err := e.get("one", "foreign", &gwv1.Gateway{}); !apierrors.IsNotFound(err) {
+		t.Errorf("Ingress of another controller was translated: %v", err)
+	}
+
+	// A LoadBalancer Service waits for its GatewayClass.
+	e.create(&corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "two", Name: "late", Annotations: map[string]string{config.AnnotationGatewayClass: "late"}},
+		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeLoadBalancer, LoadBalancerClass: ptr.To("tailnet"),
+			Ports: []corev1.ServicePort{{Name: "pg", Port: 5432}}},
+	})
+	time.Sleep(time.Second)
+	e.create(&gwv1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "late"}, Spec: gwv1.GatewayClassSpec{ControllerName: gwv1.GatewayController(config.DefaultControllerName)}})
+	e.eventually("service exposed once its class exists", func() error {
+		return e.get("two", "late", &gwv1.Gateway{})
+	})
 }

@@ -13,6 +13,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"go.pkgs.davy.tw/tailnet-gateway/internal/config"
@@ -83,7 +85,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	if gc == nil {
 		r.warn(svc, "GatewayClassNotManaged", "GatewayClass %q is not managed by this controller; skipping", className)
-		return ctrl.Result{}, r.cleanup(ctx, svc)
+		return ctrl.Result{}, r.release(ctx, svc)
 	}
 
 	plan := PlanService(svc)
@@ -96,7 +98,7 @@ func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	if plan.HTTP == nil && len(plan.TCP) == 0 {
 		r.warn(svc, "NoPorts", "no port can be exposed")
-		return ctrl.Result{}, r.cleanup(ctx, svc)
+		return ctrl.Result{}, r.release(ctx, svc)
 	}
 	gw, httpRoutes, tcpRoutes := r.objects(svc, className, plan)
 	if err := r.applyGenerated(ctx, svc, gw); err != nil {
@@ -152,6 +154,16 @@ func (r *ServiceReconciler) cleanup(ctx context.Context, svc *corev1.Service) er
 	return r.pruneGenerated(ctx, svc, config.SourceService, &gwv1.GatewayList{}, nil)
 }
 
+// release removes the generated objects of a Service that stays managed
+// but cannot be exposed, and clears its load balancer status so that
+// clients stop using an address that is no longer served.
+func (r *ServiceReconciler) release(ctx context.Context, svc *corev1.Service) error {
+	if err := r.cleanup(ctx, svc); err != nil {
+		return err
+	}
+	return r.writeStatus(ctx, svc, nil)
+}
+
 func (r *ServiceReconciler) writeStatus(ctx context.Context, svc *corev1.Service, hostnames []string) error {
 	var lbs []corev1.LoadBalancerIngress
 	for _, h := range hostnames {
@@ -169,20 +181,25 @@ func (r *ServiceReconciler) writeStatus(ctx context.Context, svc *corev1.Service
 type ServicePlan struct {
 	// Label is the Tailscale Service name shared by all ports.
 	Label string
-	// HTTP is the port served over HTTP(S), if any.
+	// HTTP is the port served over HTTP, if any.
 	HTTP     *corev1.ServicePort
-	HTTPS    bool
 	TCP      []corev1.ServicePort
 	Warnings []string
 }
 
 var (
-	httpAppProtocols  = map[string]bool{"http": true, "kubernetes.io/h2c": true, "kubernetes.io/ws": true}
-	httpsAppProtocols = map[string]bool{"https": true, "kubernetes.io/wss": true}
+	// httpAppProtocols are served by an HTTP listener.
+	httpAppProtocols = map[string]bool{"http": true, "kubernetes.io/ws": true}
+	// rawAppProtocols always stay raw TCP forwards: h2c needs HTTP/2
+	// without TLS, which a Tailscale Service HTTP port does not accept,
+	// and https and wss backends expect the client's TLS.
+	rawAppProtocols = map[string]bool{"kubernetes.io/h2c": true, "https": true, "kubernetes.io/wss": true}
 )
 
-// PlanService decides which ports become the HTTP listener and which
-// become TCP forwards.
+// PlanService decides which port becomes the HTTP listener and which
+// become TCP forwards. Only with the hostname annotation is one port
+// served over HTTP: the first with an HTTP appProtocol, or else the first
+// without a raw appProtocol. Every other TCP port is forwarded as is.
 func PlanService(svc *corev1.Service) ServicePlan {
 	plan := ServicePlan{Label: svc.Name}
 	hostname := svc.Annotations[config.AnnotationHostname]
@@ -203,25 +220,24 @@ func PlanService(svc *corev1.Service) ServicePlan {
 		}
 		return *p.AppProtocol
 	}
-	consumed := map[int32]bool{}
 	if hostname != "" {
 		for i := range tcp {
-			ap := appProto(tcp[i])
-			if httpAppProtocols[ap] || httpsAppProtocols[ap] {
-				consumed[tcp[i].Port] = true
-				if plan.HTTP == nil {
+			if httpAppProtocols[appProto(tcp[i])] {
+				plan.HTTP = &tcp[i]
+				break
+			}
+		}
+		if plan.HTTP == nil {
+			for i := range tcp {
+				if !rawAppProtocols[appProto(tcp[i])] {
 					plan.HTTP = &tcp[i]
-					plan.HTTPS = httpsAppProtocols[ap]
+					break
 				}
 			}
 		}
-		if plan.HTTP == nil && len(tcp) > 0 {
-			plan.HTTP = &tcp[0]
-			consumed[tcp[0].Port] = true
-		}
 	}
 	for _, p := range tcp {
-		if !consumed[p.Port] {
+		if plan.HTTP == nil || p.Port != plan.HTTP.Port {
 			plan.TCP = append(plan.TCP, p)
 		}
 	}
@@ -236,16 +252,9 @@ func (r *ServiceReconciler) objects(svc *corev1.Service, className string, plan 
 	var httpRoutes []*gwv1.HTTPRoute
 	var tcpRoutes []*gwv1.TCPRoute
 	if p := plan.HTTP; p != nil {
-		proto, lproto := "http", gwv1.HTTPProtocolType
-		if plan.HTTPS {
-			proto, lproto = "https", gwv1.HTTPSProtocolType
-		}
+		proto := "http"
 		lname := gwv1.SectionName(fmt.Sprintf("%s-%d", proto, p.Port))
-		l := gwv1.Listener{Name: lname, Protocol: lproto, Port: gwv1.PortNumber(p.Port)}
-		if plan.HTTPS {
-			l.TLS = tailscaleTLSOptions()
-		}
-		gw.Spec.Listeners = append(gw.Spec.Listeners, l)
+		gw.Spec.Listeners = append(gw.Spec.Listeners, gwv1.Listener{Name: lname, Protocol: gwv1.HTTPProtocolType, Port: gwv1.PortNumber(p.Port)})
 		httpRoutes = append(httpRoutes, &gwv1.HTTPRoute{
 			ObjectMeta: sourceMeta(svc, "Service", "v1", config.SourceService, fmt.Sprintf("%s-%s-%d", svc.Name, proto, p.Port)),
 			Spec: gwv1.HTTPRouteSpec{
@@ -276,13 +285,30 @@ func (r *ServiceReconciler) objects(svc *corev1.Service, className string, plan 
 	return gw, httpRoutes, tcpRoutes
 }
 
+// managedServices enqueues every Service of the LoadBalancer class, so
+// that a GatewayClass created later picks them up.
+func (r *ServiceReconciler) managedServices(ctx context.Context, _ client.Object) []reconcile.Request {
+	var list corev1.ServiceList
+	if err := r.List(ctx, &list); err != nil {
+		return nil
+	}
+	var out []reconcile.Request
+	for i := range list.Items {
+		if r.managed(&list.Items[i]) {
+			out = append(out, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&list.Items[i])})
+		}
+	}
+	return out
+}
+
 // SetupWithManager registers the reconciler.
 func (r *ServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	b := ctrl.NewControllerManagedBy(mgr).
 		Named("service").
 		For(&corev1.Service{}).
 		Owns(&gwv1.Gateway{}).
-		Owns(&gwv1.HTTPRoute{})
+		Owns(&gwv1.HTTPRoute{}).
+		Watches(&gwv1.GatewayClass{}, handler.EnqueueRequestsFromMapFunc(r.managedServices))
 	if r.Features.TCPRoute {
 		b = b.Owns(&gwv1.TCPRoute{})
 	}

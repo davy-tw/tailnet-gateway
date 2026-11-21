@@ -174,7 +174,9 @@ long) is reset and re-registered.
 ### Proxy pods
 
 - One container with the configured image, running tailscaled in userspace
-  networking mode, with no added Linux capabilities.
+  networking mode as a non-root user, with no Linux capabilities and the
+  `RuntimeDefault` seccomp profile, so the pods meet the `restricted` Pod
+  Security Standard.
 - Tailnet hostname `<NS>-<N>-<i>`.
 - The serve config ConfigMap is mounted and passed through the image's
   serve-config environment variable, so the container applies it on start
@@ -184,13 +186,21 @@ long) is reset and re-registered.
   Tailscale Service in the config. Before stop, a hook runs
   `tailscale serve drain svc:<name>` for each (ignoring failures) and waits,
   so `terminationGracePeriodSeconds` covers the drain window.
-- Readiness uses the image's health endpoint, so a replica is ready once
-  tailscaled is logged in.
+- A replica is ready once tailscaled is up and runs a serve config with
+  exactly the Tailscale Services of the mounted one (checked with
+  `tailscale serve status`). Having a tailnet IP alone is not enough, since
+  the Gateway counts ready replicas and the PDB lets another replica go.
 - Soft pod anti-affinity on `kubernetes.io/hostname` and topology spread
   across zones keep one node or zone from taking out every replica.
 - Pod management policy `Parallel`: replicas are independent.
 - The selector uses a fixed app label and an instance label equal to the
   Gateway name. It is immutable, so other labels never go into it.
+- Gateway names are limited to 52 characters: the StatefulSet's pods carry
+  a `<name>-<hash>` revision label, and label values are limited to 63.
+  Longer names leave the Gateway `Programmed=False`.
+- An existing object with a data-plane name that the Gateway does not
+  control is never taken over (it would be garbage-collected with the
+  Gateway); the Gateway stays `Programmed=False` and says why.
 
 ### RBAC
 
@@ -262,11 +272,16 @@ dropped silently. One route never fails the whole Gateway.
   named after the route or the `tailscale-service` annotation.
 - Tailscale Service names are single DNS labels. A hostname must be a single
   label (`demo`) or a name under the tailnet (`demo.tail1234.ts.net`); both
-  become `svc:demo`, reachable at `demo.<tailnet>.ts.net`. Anything else is
-  reported on the route.
-- When routes compete for the same Tailscale Service, compatible routes are
-  merged. Where they claim the same path or port, the oldest route wins and
-  newer routes get `Accepted=False` with reason `Conflicted`.
+  become `svc:demo`, reachable at `demo.<tailnet>.ts.net`. Anything else,
+  including a name under another tailnet, is reported on the route.
+- When routes of one Gateway compete for the same Tailscale Service,
+  compatible routes are merged. Where they claim the same path or port, the
+  oldest route wins and newer routes get `Accepted=False` with reason
+  `Conflicted`.
+- Tailscale Service names are tailnet-wide, so a name belongs to one
+  Gateway: if two Gateways advertised it, its traffic would be spread over
+  both Gateways' backends. The oldest Gateway serving a name keeps it, and
+  routes of newer Gateways that map to it get `Conflicted`.
 - Tailscale Services must be defined, and their hosts approved, in the
   tailnet. The controller does not manage them. Hosts must be tagged
   devices, and new replicas wait for approval unless the tailnet policy has
@@ -285,6 +300,10 @@ dropped silently. One route never fails the whole Gateway.
 - Backend targets are always fully qualified:
   `<name>.<namespace>.svc.<cluster-domain>:<port>`, with the namespace
   defaulting to the route's namespace.
+- A backend that cannot be used (not found, not permitted, or with a
+  BackendTLSPolicy that cannot be honored) keeps its mount point, pointed at
+  an address where nothing listens, so its requests fail instead of falling
+  through to a shorter path prefix that belongs to another backend.
 - TCPRoute and TLSRoute take the port of the listener they attach to.
 
 ### BackendTLSPolicy
@@ -292,10 +311,11 @@ dropped silently. One route never fails the whole Gateway.
 A BackendTLSPolicy in the backend's namespace that targets the backend
 Service (honoring `sectionName`) switches that backend to `https`. The serve
 config can only verify against the system roots and the backend's own name,
-so verification happens when the policy uses `wellKnownCACertificates:
-System` and a `hostname` equal to the backend's cluster FQDN. Otherwise the
-connection uses TLS without verification (`https+insecure`), and the policy
-status says so.
+so a policy is honored when it uses `wellKnownCACertificates: System`, a
+`hostname` equal to the backend's cluster FQDN and no `subjectAltNames`.
+Any other policy is not downgraded to TLS without verification: it gets
+`Accepted=False` with reason `Invalid`, the routes using that backend get
+`ResolvedRefs=False`, and the backend is not used.
 
 ### ReferenceGrant
 
@@ -330,7 +350,9 @@ known, web handlers are left out and the Gateway stays `Programmed=False`.
 ## Ingress translation
 
 Applies to Ingresses whose `spec.ingressClassName` is the configured
-IngressClass, or that have none while that class is the cluster default.
+IngressClass, or that have none while that class is the cluster default,
+and only while that IngressClass names this controller in
+`spec.controller`.
 For Ingress `I`, the controller applies a Gateway `I` and HTTPRoutes owned by
 the Ingress and annotated `source: ingress`:
 
@@ -342,7 +364,9 @@ the Ingress and annotated `source: ingress`:
   event is recorded on the Ingress.
 - Named ports are resolved through the Service. Backends that are not
   Services are skipped with a warning event.
-- `defaultBackend` is used, as a `/` rule, only when there are no rules.
+- `defaultBackend` takes the requests no rule matches: it is added as a
+  `/` rule to every host that has none, and to a route without hostnames
+  for hosts without rules.
 - The Gateway's addresses are written to `status.loadBalancer.ingress[]`.
 - When the Ingress is deleted or stops being served, the generated objects
   are deleted.
@@ -354,22 +378,25 @@ configured LoadBalancer class. The controller adds its finalizer to the
 Service.
 
 - The `hostname` annotation names the Tailscale Service (default: the
-  Service's name) and switches on HTTP handling: the first TCP port whose
-  `appProtocol` is `http`, `kubernetes.io/h2c` or `kubernetes.io/ws` (HTTP),
-  or `https` or `kubernetes.io/wss` (HTTPS), or else the first TCP port as
-  HTTP, gets an HTTP(S) listener and an HTTPRoute. Other HTTP-ish ports are
-  consumed by it.
+  Service's name) and switches on HTTP handling for one port: the first TCP
+  port whose `appProtocol` is `http` or `kubernetes.io/ws`, or else the
+  first TCP port whose `appProtocol` is not `kubernetes.io/h2c`, `https` or
+  `kubernetes.io/wss`, gets an HTTP listener and an HTTPRoute. h2c needs
+  HTTP/2 without TLS, which a Tailscale Service HTTP port does not accept,
+  and TLS backends expect the client's TLS, so those ports stay raw.
 - Every other TCP port becomes a TCPRoute on the same Tailscale Service.
   UDP and SCTP ports are skipped with a warning event.
 - Generated objects are owned by the Service and annotated
   `source: service`: a Gateway named after the Service with one listener per
-  handled port (`http-80`, `tcp-5432`, ...), HTTPRoute
-  `<svc>-<http|https>-<port>` and TCPRoute `<svc>-tcp-<port>`. The Service is
+  handled port (`http-80`, `tcp-5432`, ...), HTTPRoute `<svc>-http-<port>`
+  and TCPRoute `<svc>-tcp-<port>`. The Service is
   the backend of its own Gateway, so traffic goes through its cluster IP.
 - Routes for ports removed from the Service are pruned.
 - The Gateway's addresses are written to `status.loadBalancer.ingress[]`.
 - On deletion, or when the Service stops being served, the generated objects
-  are deleted and the finalizer is removed.
+  are deleted and the finalizer is removed. When it can no longer be exposed
+  (its GatewayClass is not served, or no port is left), the generated
+  objects are deleted and its load balancer status is cleared.
 
 ## Gateway deletion
 

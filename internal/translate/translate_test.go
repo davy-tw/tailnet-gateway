@@ -205,7 +205,7 @@ func TestHostnameRules(t *testing.T) {
 		{"demo", "demo", true},
 		{"Demo", "demo", true},
 		{"demo." + domain, "demo", true},
-		{"demo.other.ts.net", "demo", true},
+		{"demo.other.ts.net", "", false},
 		{"demo.example.com", "", false},
 		{"*.example.com", "", false},
 		{"under_score", "", false},
@@ -322,8 +322,9 @@ func TestCrossNamespace(t *testing.T) {
 
 	res := Translate(&Input{Gateway: gw, TailnetDomain: domain, HTTPRoutes: []*gwv1.HTTPRoute{mk()}})
 	expectCond(t, routeConds(t, res, KindHTTPRoute, "r"), "ResolvedRefs", metav1.ConditionFalse, "RefNotPermitted")
-	if len(res.Config.Services) != 0 {
-		t.Error("no service expected without a grant")
+	// Requests fail instead of reaching the backend.
+	if h := res.Config.Services["svc:x"].Web["x."+domain+":80"].Handlers["/"]; h.Proxy != "http://127.0.0.1:1/" {
+		t.Errorf("proxy without a grant = %s", h.Proxy)
 	}
 
 	grant := &gwv1.ReferenceGrant{
@@ -564,17 +565,34 @@ func TestBackendTLSPolicy(t *testing.T) {
 	if len(res.Policies) != 1 || res.Policies[0].Ref.Name != "verified" {
 		t.Errorf("policies = %+v", res.Policies)
 	}
+	// Verification that serve cannot do fails closed: the backend is not
+	// reached without verification.
 	proxy, res = run(policy("custom-ca", "secure.example.com", false))
-	if proxy != "https+insecure://secure.infra.svc.cluster.local:443/" {
+	if proxy != "http://127.0.0.1:1/" {
 		t.Errorf("proxy = %s", proxy)
 	}
-	if !strings.Contains(res.Policies[0].Conditions[0].Message, "not verified") {
-		t.Errorf("policy message = %q", res.Policies[0].Conditions[0].Message)
+	if c := res.Policies[0].Conditions[0]; c.Status != metav1.ConditionFalse || c.Reason != "Invalid" {
+		t.Errorf("policy condition = %+v", c)
 	}
+	expectCond(t, routeConds(t, res, KindHTTPRoute, "r"), "ResolvedRefs", metav1.ConditionFalse, "UnsupportedProtocol")
 	other := policy("elsewhere", "x", true)
 	other.Namespace = "other"
 	proxy, _ = run(other)
 	if proxy != "http://secure.infra.svc.cluster.local:443/" {
 		t.Errorf("policy from another namespace must not apply: %s", proxy)
+	}
+}
+
+func TestServiceClaimedByOtherGateway(t *testing.T) {
+	res := Translate(&Input{
+		Gateway:         gateway(listener("http", gwv1.HTTPProtocolType, 80)),
+		TailnetDomain:   domain,
+		HTTPRoutes:      []*gwv1.HTTPRoute{httpRoute("infra", "r", 1, []string{"web"}, rule(backendRef("web", 80)))},
+		ClaimedServices: map[string]string{"web": "other/gw"},
+	})
+	conds := routeConds(t, res, KindHTTPRoute, "r")
+	expectCond(t, conds, "Accepted", metav1.ConditionFalse, ReasonConflicted)
+	if _, ok := res.Config.Services["svc:web"]; ok {
+		t.Errorf("svc:web must not be served: %s", mustJSON(t, res.Config))
 	}
 }

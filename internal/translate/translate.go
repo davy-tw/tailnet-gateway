@@ -65,6 +65,11 @@ type Input struct {
 	// Supported lists the route kinds whose CRDs are served. A nil map
 	// means all kinds are supported.
 	Supported map[string]bool
+	// ClaimedServices maps a Tailscale Service name (without "svc:") to
+	// the older Gateway ("namespace/name") that already serves it. Names
+	// are tailnet-wide, so a Gateway never serves a name another Gateway
+	// has claimed: their hosts would share its traffic.
+	ClaimedServices map[string]string
 }
 
 // RouteRef identifies a route.
@@ -169,8 +174,9 @@ type mount struct {
 }
 
 type policyState struct {
-	policy  *gwv1.BackendTLSPolicy
-	message string
+	policy   *gwv1.BackendTLSPolicy
+	accepted bool
+	message  string
 }
 
 func (t *translator) supported(kind string) bool {
@@ -603,6 +609,8 @@ func dedupe(in []string) []string {
 // ServiceLabel maps a route hostname to a Tailscale Service name (without
 // "svc:"). Tailscale Service names are single DNS labels; a hostname under
 // the tailnet's MagicDNS domain is accepted and reduced to its first label.
+// While the domain is unknown, any "*.ts.net" name is accepted; once it is
+// known, names under another tailnet are rejected.
 func ServiceLabel(hostname, tailnetDomain string) (string, error) {
 	h := strings.TrimSuffix(strings.ToLower(hostname), ".")
 	if strings.HasPrefix(h, "*") {
@@ -610,7 +618,13 @@ func ServiceLabel(hostname, tailnetDomain string) (string, error) {
 	}
 	label := h
 	if first, rest, ok := strings.Cut(h, "."); ok {
-		if !(tailnetDomain != "" && rest == strings.ToLower(tailnetDomain)) && !strings.HasSuffix(rest, ".ts.net") {
+		switch {
+		case tailnetDomain != "" && rest == strings.ToLower(tailnetDomain):
+		case tailnetDomain != "" && strings.HasSuffix(rest, ".ts.net"):
+			return "", fmt.Errorf("hostname %q is not in this tailnet (%s)", hostname, tailnetDomain)
+		case tailnetDomain == "" && strings.HasSuffix(rest, ".ts.net"):
+			// Accepted until the tailnet domain is known.
+		default:
 			return "", fmt.Errorf("hostname %q must be a single DNS label (for example %q), which becomes %s.<tailnet>.ts.net", hostname, first, first)
 		}
 		label = first
@@ -694,6 +708,27 @@ func (rc *routeCtx) resolveBackend(ref gwv1.BackendObjectReference) (*backend, b
 	}, true
 }
 
+// rejectBackend is where requests for an unusable backend go: nothing
+// listens there, so they fail instead of falling through to a shorter
+// path prefix that belongs to another backend.
+func rejectBackend() *backend {
+	return &backend{host: "127.0.0.1", port: 1, scheme: "http"}
+}
+
+// httpBackend resolves an HTTP-like backend and applies BackendTLSPolicy.
+// An unusable backend is reported on the route and mapped to rejectBackend.
+func (rc *routeCtx) httpBackend(ref gwv1.BackendObjectReference) *backend {
+	b, ok := rc.resolveBackend(ref)
+	if !ok {
+		return rejectBackend()
+	}
+	if !rc.t.applyBackendTLS(b) {
+		rc.unresolvedf(gwv1.RouteReasonUnsupportedProtocol, "backend Service %s/%s: its BackendTLSPolicy cannot be honored", b.ns, b.name)
+		return rejectBackend()
+	}
+	return b
+}
+
 func (t *translator) grantAllows(fromKind, fromNS, toNS, toName string) bool {
 	for _, g := range t.in.ReferenceGrants {
 		if g.Namespace != toNS {
@@ -719,8 +754,10 @@ func (t *translator) grantAllows(fromKind, fromNS, toNS, toName string) bool {
 }
 
 // applyBackendTLS upgrades an HTTP-like backend to TLS when a
-// BackendTLSPolicy in the backend's namespace targets it.
-func (t *translator) applyBackendTLS(b *backend) {
+// BackendTLSPolicy in the backend's namespace targets it. It returns false
+// when the policy asks for verification that Tailscale serve cannot do: the
+// backend must then not be used, rather than reached without verification.
+func (t *translator) applyBackendTLS(b *backend) bool {
 	var match *gwv1.BackendTLSPolicy
 	for _, p := range t.in.BackendTLSPolicies {
 		if p.Namespace != b.ns {
@@ -740,23 +777,23 @@ func (t *translator) applyBackendTLS(b *backend) {
 		}
 	}
 	if match == nil {
-		return
+		return true
 	}
 	key := types.NamespacedName{Namespace: match.Namespace, Name: match.Name}
 	v := match.Spec.Validation
 	verified := len(v.CACertificateRefs) == 0 && v.WellKnownCACertificates != nil &&
 		*v.WellKnownCACertificates == gwv1.WellKnownCACertificatesSystem &&
 		strings.EqualFold(string(v.Hostname), b.host) && len(v.SubjectAltNames) == 0
-	ps := &policyState{policy: match}
 	if verified {
 		b.scheme = "https"
-		ps.message = "TLS to the backend is verified against the system CAs"
-	} else {
-		b.scheme = "https+insecure"
-		ps.message = fmt.Sprintf("TLS to the backend is used, but the certificate is not verified: "+
-			"Tailscale serve can only verify against system CAs with the hostname %s", b.host)
+		t.policies[key] = &policyState{policy: match, accepted: true,
+			message: "TLS to the backend is verified against the system CAs"}
+		return true
 	}
-	t.policies[key] = ps
+	t.policies[key] = &policyState{policy: match, message: fmt.Sprintf("Tailscale serve can only verify backend "+
+		"certificates against the system CAs (wellKnownCACertificates: System) with the hostname %s, "+
+		"and no subjectAltNames; the backend is not used", b.host)}
+	return false
 }
 
 func (t *translator) portNameMatches(b *backend, name string) bool {
@@ -775,11 +812,18 @@ func (t *translator) portNameMatches(b *backend, name string) bool {
 	return false
 }
 
+func policyAccepted(ps *policyState) metav1.Condition {
+	if ps.accepted {
+		return cond(gwv1.PolicyConditionAccepted, true, gwv1.PolicyReasonAccepted, ps.message, ps.policy.Generation)
+	}
+	return cond(gwv1.PolicyConditionAccepted, false, gwv1.PolicyReasonInvalid, ps.message, ps.policy.Generation)
+}
+
 func (t *translator) policyResults() []PolicyResult {
 	var out []PolicyResult
 	for key, ps := range t.policies {
 		out = append(out, PolicyResult{Ref: key, Conditions: []metav1.Condition{
-			cond(gwv1.PolicyConditionAccepted, true, gwv1.PolicyReasonAccepted, ps.message, ps.policy.Generation),
+			policyAccepted(ps),
 		}})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Ref.String() < out[j].Ref.String() })
@@ -859,11 +903,7 @@ func (rc *routeCtx) httpRoute(r *gwv1.HTTPRoute) {
 			continue
 		}
 		usableRules++
-		b, ok := rc.resolveBackend(br.BackendObjectReference)
-		if !ok {
-			continue
-		}
-		rc.t.applyBackendTLS(b)
+		b := rc.httpBackend(br.BackendObjectReference)
 		for _, p := range paths {
 			mounts = append(mounts, httpMount{path: p, backend: b})
 		}
@@ -934,11 +974,7 @@ func (rc *routeCtx) grpcRoute(r *gwv1.GRPCRoute) {
 			continue
 		}
 		usableRules++
-		b, ok := rc.resolveBackend(br.BackendObjectReference)
-		if !ok {
-			continue
-		}
-		rc.t.applyBackendTLS(b)
+		b := rc.httpBackend(br.BackendObjectReference)
 		for _, p := range paths {
 			mounts = append(mounts, httpMount{path: p, backend: b})
 		}
@@ -1026,8 +1062,19 @@ func (t *translator) svc(label string) *svcState {
 	return s
 }
 
+// claimed returns a conflict message when another Gateway serves label.
+func (t *translator) claimed(label string) string {
+	if gw, ok := t.in.ClaimedServices[label]; ok {
+		return fmt.Sprintf("svc:%s is already served by Gateway %s", label, gw)
+	}
+	return ""
+}
+
 // addMount places an HTTP mount; it returns a conflict message or "".
 func (t *translator) addMount(label string, port uint16, mode string, m httpMount, owner RouteRef) string {
+	if c := t.claimed(label); c != "" {
+		return c
+	}
 	s := t.svc(label)
 	ps := s.ports[port]
 	if ps == nil {
@@ -1177,6 +1224,9 @@ func (rc *routeCtx) finishStream(hostnames []gwv1.Hostname, useHostnames bool, d
 func hostPort(b *backend) string { return b.host + ":" + strconv.Itoa(int(b.port)) }
 
 func (t *translator) addStream(label string, port uint16, mode, target string, owner RouteRef) string {
+	if c := t.claimed(label); c != "" {
+		return c
+	}
 	s := t.svc(label)
 	if ps := s.ports[port]; ps != nil {
 		if ps.owner == owner && ps.mode == mode && ps.target == target {

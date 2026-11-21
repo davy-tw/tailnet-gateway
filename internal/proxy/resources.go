@@ -33,7 +33,9 @@ const (
 	ServeConfigKey = "serve.json"
 	ServeConfigDir = "/etc/tailnet-gateway"
 	SocketPath     = "/tmp/tailscaled.sock"
-	HealthPort     = 9002
+	// ProxyUID runs the proxy containers as a non-root user. tailscaled
+	// keeps its state in the state Secret and its files under /tmp.
+	ProxyUID int64 = 1000
 
 	// Keys the Tailscale container reads and writes in its state Secret.
 	KeyAuthKey    = "authkey"
@@ -145,6 +147,20 @@ func AdvertiseScript() string {
 	}, "\n")
 }
 
+// ReadyScript succeeds once tailscaled is up and the serve config it runs
+// has exactly the Tailscale Services of the mounted config: an IP alone
+// does not mean the replica serves the current config yet.
+func ReadyScript() string {
+	return strings.Join([]string{
+		"CFG=" + shellQuote(ServeConfigDir+"/"+ServeConfigKey),
+		"TS=" + shellQuote("tailscale --socket="+SocketPath),
+		`$TS status >/dev/null 2>&1 || exit 1`,
+		`want=$(` + servicesInConfig + `)`,
+		`have=$($TS serve status --json 2>/dev/null | grep -o '"svc:[a-z0-9-]*"' | tr -d '"' | sort -u)`,
+		`[ "$want" = "$have" ]`,
+	}, "\n")
+}
+
 // DrainScript drains every Tailscale Service, then waits so that open
 // connections can finish before the container is stopped.
 func DrainScript(waitSeconds int64) string {
@@ -185,8 +201,6 @@ func (s *Spec) StatefulSet() *appsv1.StatefulSet {
 		{Name: "TS_SERVE_CONFIG", Value: ServeConfigDir + "/" + ServeConfigKey},
 		{Name: "TS_SOCKET", Value: SocketPath},
 		{Name: "TS_AUTH_ONCE", Value: "true"},
-		{Name: "TS_ENABLE_HEALTH_CHECK", Value: "true"},
-		{Name: "TS_LOCAL_ADDR_PORT", Value: fmt.Sprintf("[::]:%d", HealthPort)},
 	}
 	selector := &metav1.LabelSelector{MatchLabels: SelectorLabels(s.Gateway)}
 	return &appsv1.StatefulSet{
@@ -198,7 +212,15 @@ func (s *Spec) StatefulSet() *appsv1.StatefulSet {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
-					ServiceAccountName:            s.Gateway,
+					ServiceAccountName: s.Gateway,
+					// Userspace networking needs no privileges, so the pods
+					// meet the "restricted" Pod Security Standard.
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot:   ptr.To(true),
+						RunAsUser:      ptr.To(ProxyUID),
+						RunAsGroup:     ptr.To(ProxyUID),
+						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+					},
 					TerminationGracePeriodSeconds: ptr.To(grace),
 					Affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
 						PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
@@ -219,15 +241,15 @@ func (s *Spec) StatefulSet() *appsv1.StatefulSet {
 						Name:  "tailscale",
 						Image: s.Params.Image,
 						Env:   env,
-						Ports: []corev1.ContainerPort{{Name: "health", ContainerPort: HealthPort, Protocol: corev1.ProtocolTCP}},
 						VolumeMounts: []corev1.VolumeMount{{
 							Name: "serve-config", MountPath: ServeConfigDir, ReadOnly: true,
 						}},
 						ReadinessProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
-								Path: "/healthz", Port: intstr.FromString("health"),
+							ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{
+								Command: []string{"/bin/sh", "-c", ReadyScript()},
 							}},
 							PeriodSeconds:    5,
+							TimeoutSeconds:   5,
 							FailureThreshold: 2,
 						},
 						Lifecycle: &corev1.Lifecycle{

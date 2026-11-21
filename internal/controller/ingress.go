@@ -43,21 +43,21 @@ func (r *IngressReconciler) warn(obj runtime.Object, reason, msg string, args ..
 	}
 }
 
-// managed reports whether the Ingress belongs to this controller.
+// managed reports whether the Ingress belongs to this controller: its
+// class (named, or the cluster default when none is named) is the
+// configured IngressClass, and that class names this controller.
 func (r *IngressReconciler) managed(ctx context.Context, ing *networkingv1.Ingress) (bool, error) {
-	if ing.Spec.IngressClassName != nil {
-		return *ing.Spec.IngressClassName == r.Config.IngressClass, nil
+	if ing.Spec.IngressClassName != nil && *ing.Spec.IngressClassName != r.Config.IngressClass {
+		return false, nil
 	}
-	var list networkingv1.IngressClassList
-	if err := r.List(ctx, &list); err != nil {
-		return false, err
+	ic := &networkingv1.IngressClass{}
+	if err := r.Get(ctx, types.NamespacedName{Name: r.Config.IngressClass}, ic); err != nil {
+		return false, client.IgnoreNotFound(err)
 	}
-	for _, ic := range list.Items {
-		if ic.Annotations[annotationDefaultIngressClass] == "true" && ic.Name == r.Config.IngressClass {
-			return true, nil
-		}
+	if ic.Spec.Controller != config.IngressControllerName {
+		return false, nil
 	}
-	return false, nil
+	return ing.Spec.IngressClassName != nil || ic.Annotations[annotationDefaultIngressClass] == "true", nil
 }
 
 // Reconcile implements reconcile.Reconciler.
@@ -190,12 +190,25 @@ func (r *IngressReconciler) translate(ctx context.Context, ing *networkingv1.Ing
 			})
 		}
 	}
-	if len(ing.Spec.Rules) == 0 && ing.Spec.DefaultBackend != nil {
+	// The default backend takes every request that no rule matches: the
+	// rest of each host's paths, and hosts without rules (the route without
+	// hostnames, served under the Ingress's name).
+	if ing.Spec.DefaultBackend != nil {
 		if be, ok := r.backendRef(ctx, ing, *ing.Spec.DefaultBackend); ok {
-			groups = []*group{{rules: []gwv1.HTTPRouteRule{{
+			fallback := gwv1.HTTPRouteRule{
 				Matches:     []gwv1.HTTPRouteMatch{{Path: &gwv1.HTTPPathMatch{Type: ptr.To(gwv1.PathMatchPathPrefix), Value: ptr.To("/")}}},
 				BackendRefs: []gwv1.HTTPBackendRef{{BackendRef: be}},
-			}}}}
+			}
+			if byHost[""] == nil {
+				g := &group{}
+				byHost[""] = g
+				groups = append(groups, g)
+			}
+			for _, g := range groups {
+				if !hasRootPrefix(g.rules) {
+					g.rules = append(g.rules, fallback)
+				}
+			}
 		}
 	}
 	var routes []*gwv1.HTTPRoute
@@ -220,6 +233,19 @@ func (r *IngressReconciler) translate(ctx context.Context, ing *networkingv1.Ing
 		routes = append(routes, rt)
 	}
 	return gw, routes
+}
+
+// hasRootPrefix reports whether a rule already matches every path.
+func hasRootPrefix(rules []gwv1.HTTPRouteRule) bool {
+	for _, rule := range rules {
+		for _, m := range rule.Matches {
+			if m.Path != nil && m.Path.Type != nil && *m.Path.Type == gwv1.PathMatchPathPrefix &&
+				m.Path.Value != nil && *m.Path.Value == "/" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // backendRef converts an Ingress backend, resolving named ports through
@@ -288,6 +314,7 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&gwv1.Gateway{}).
 		Owns(&gwv1.HTTPRoute{}).
 		Watches(&networkingv1.IngressClass{}, handler.EnqueueRequestsFromMapFunc(r.allIngresses)).
+		Watches(&gwv1.GatewayClass{}, handler.EnqueueRequestsFromMapFunc(r.allIngresses)).
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.ingressesForService),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Complete(r)

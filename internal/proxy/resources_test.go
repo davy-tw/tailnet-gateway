@@ -53,6 +53,12 @@ func TestStatefulSet(t *testing.T) {
 	if !strings.Contains(c.Lifecycle.PreStop.Exec.Command[2], "serve drain") || !strings.Contains(c.Lifecycle.PreStop.Exec.Command[2], "sleep 25") {
 		t.Errorf("preStop = %s", c.Lifecycle.PreStop.Exec.Command[2])
 	}
+	if psc := pod.SecurityContext; psc == nil || !*psc.RunAsNonRoot || *psc.RunAsUser == 0 || psc.SeccompProfile.Type != "RuntimeDefault" {
+		t.Errorf("pod security context = %+v", psc)
+	}
+	if !strings.Contains(c.ReadinessProbe.Exec.Command[2], "serve status --json") {
+		t.Errorf("readiness = %+v", c.ReadinessProbe)
+	}
 	if !strings.Contains(c.Lifecycle.PostStart.Exec.Command[2], "serve advertise") {
 		t.Errorf("postStart = %s", c.Lifecycle.PostStart.Exec.Command[2])
 	}

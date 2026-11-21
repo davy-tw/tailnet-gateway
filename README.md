@@ -37,6 +37,8 @@ kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/re
 kubectl apply -f dist/install.yaml
 kubectl -n tailnet-gateway-system create secret generic tailnet-gateway \
   --from-literal=TAILSCALE_OAUTH_CLIENT_ID=... --from-literal=TAILSCALE_OAUTH_CLIENT_SECRET=...
+# The settings are read at start-up: restart after creating or changing them.
+kubectl -n tailnet-gateway-system rollout restart deployment/tailnet-gateway
 kubectl apply -f examples/demo.yaml
 ```
 
@@ -80,7 +82,7 @@ cannot override them.
 | Annotation | On | Meaning |
 | --- | --- | --- |
 | `tailnet-gateway.davy.tw/gateway-class` | Ingress, Service | Use another managed GatewayClass |
-| `tailnet-gateway.davy.tw/hostname` | LoadBalancer Service | Tailscale Service name; also serves the first HTTP-ish port (`appProtocol` `http`, `https`, `kubernetes.io/h2c`, `kubernetes.io/ws`, `kubernetes.io/wss`, or else the first port) over HTTP(S) |
+| `tailnet-gateway.davy.tw/hostname` | LoadBalancer Service | Tailscale Service name; also serves one port over HTTP: the first with `appProtocol` `http` or `kubernetes.io/ws`, or else the first that is not `kubernetes.io/h2c`, `https` or `kubernetes.io/wss`. Other ports are forwarded as raw TCP |
 | `tailnet-gateway.davy.tw/tailscale-service` | TCPRoute, TLSRoute | Tailscale Service name instead of the route name |
 
 ## What is supported
@@ -102,8 +104,9 @@ silently dropping it.
 | UDP listeners and UDPRoute | No: Tailscale Services are TCP-only |
 | Cross-namespace backends | With a ReferenceGrant |
 | `allowedRoutes` (namespaces and kinds), `sectionName`, `port`, hostname intersection | Yes |
-| BackendTLSPolicy | Upgrades the backend hop to TLS. Verification only with `wellKnownCACertificates: System` and a `hostname` equal to the backend's cluster FQDN; otherwise TLS without verification, stated on the policy status |
+| BackendTLSPolicy | Upgrades the backend hop to verified TLS. Only `wellKnownCACertificates: System` with a `hostname` equal to the backend's cluster FQDN can be honored; other policies are `Accepted=False` and their backend is not used |
 | Route conflicts | Oldest route wins a path or port; newer routes report `Conflicted` |
+| Tailscale Service names across Gateways | A name belongs to the oldest Gateway serving it; routes of newer Gateways report `Conflicted` |
 
 Hostnames must be single DNS labels (`demo`) or names under the tailnet
 (`demo.tail1234.ts.net`): each becomes the Tailscale Service `svc:demo`,
@@ -117,8 +120,10 @@ update their own state Secrets), ConfigMap `N` (the serve config), StatefulSet
 `N`, a PodDisruptionBudget `N` (`maxUnavailable: 1`, from two replicas up)
 and one state Secret `N-<i>` per replica.
 
-- Replicas run tailscaled in userspace mode with no added capabilities, as
-  devices named `<NS>-<N>-<i>`. A rescheduled replica finds its state Secret
+- Replicas run tailscaled in userspace mode as a non-root user with no
+  capabilities (the `restricted` Pod Security Standard), as devices named
+  `<NS>-<N>-<i>`. A replica is ready once it runs the current serve config.
+  Gateway names are limited to 52 characters. A rescheduled replica finds its state Secret
   and comes back as the same device.
 - After start, each replica advertises its Tailscale Services; before stop it
   runs `tailscale serve drain` for each and waits for the grace period, so

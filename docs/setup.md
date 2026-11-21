@@ -32,7 +32,11 @@ kubectl -n tailnet-gateway-system create secret generic tailnet-gateway \
   --from-literal=TAILSCALE_OAUTH_CLIENT_ID=... \
   --from-literal=TAILSCALE_OAUTH_CLIENT_SECRET=... \
   --from-literal=PROXY_TAGS=tag:k8s-gateway
+kubectl -n tailnet-gateway-system rollout restart deployment/tailnet-gateway
 ```
+
+The controller reads these settings at start-up, so restart it whenever the
+Secret is created or changed.
 
 `PROXY_TAGS` may be left out: the keys then carry the OAuth client's own tags.
 Per-class tags go in the GatewayClass parameters (see the README).

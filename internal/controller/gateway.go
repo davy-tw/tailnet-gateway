@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -23,6 +24,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -33,6 +35,7 @@ import (
 
 	"go.pkgs.davy.tw/tailnet-gateway/internal/config"
 	"go.pkgs.davy.tw/tailnet-gateway/internal/proxy"
+	"go.pkgs.davy.tw/tailnet-gateway/internal/serveconf"
 	"go.pkgs.davy.tw/tailnet-gateway/internal/tailscale"
 	"go.pkgs.davy.tw/tailnet-gateway/internal/translate"
 )
@@ -128,6 +131,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	in.TailnetDomain = r.Config.TailnetDomain
 	if in.TailnetDomain == "" {
 		in.TailnetDomain = r.learnDomain(ctx, gw)
+	}
+	if in.ClaimedServices, err = r.claimedServices(ctx, gw); err != nil {
+		return ctrl.Result{}, err
 	}
 	res := translate.Translate(in)
 
@@ -291,6 +297,51 @@ func needsNamespaceLabels(gw *gwv1.Gateway) bool {
 	return false
 }
 
+// claimedServices returns the Tailscale Service names that older Gateways
+// already serve, read from their serve config ConfigMaps. Names are
+// tailnet-wide: if two Gateways advertised the same name, its traffic would
+// be spread over both Gateways' backends. The oldest Gateway keeps a name.
+func (r *GatewayReconciler) claimedServices(ctx context.Context, gw *gwv1.Gateway) (map[string]string, error) {
+	var cms corev1.ConfigMapList
+	if err := r.List(ctx, &cms, client.MatchingLabels{proxy.LabelName: proxy.AppName, proxy.LabelManagedBy: proxy.ManagedBy}); err != nil {
+		return nil, err
+	}
+	claimed := map[string]string{}
+	for i := range cms.Items {
+		cm := &cms.Items[i]
+		owner := metav1.GetControllerOf(cm)
+		if owner == nil || owner.Kind != translate.KindGateway || owner.UID == gw.UID {
+			continue
+		}
+		other := &gwv1.Gateway{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: cm.Namespace, Name: owner.Name}, other); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, err
+		}
+		if other.UID != owner.UID || !olderGateway(other, gw) {
+			continue
+		}
+		var sc serveconf.Config
+		if err := json.Unmarshal([]byte(cm.Data[proxy.ServeConfigKey]), &sc); err != nil {
+			continue
+		}
+		for _, l := range sc.Labels() {
+			claimed[l] = other.Namespace + "/" + other.Name
+		}
+	}
+	return claimed, nil
+}
+
+// olderGateway orders Gateways by creation time, then by namespace/name.
+func olderGateway(a, b *gwv1.Gateway) bool {
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	}
+	return a.Namespace+"/"+a.Name < b.Namespace+"/"+b.Name
+}
+
 // learnDomain reads the tailnet MagicDNS suffix from any replica's state
 // Secret, where the Tailscale container records its device FQDN.
 func (r *GatewayReconciler) learnDomain(ctx context.Context, gw *gwv1.Gateway) string {
@@ -349,6 +400,10 @@ func ownerRef(gw *gwv1.Gateway) metav1.OwnerReference {
 }
 
 func (r *GatewayReconciler) provision(ctx context.Context, gw *gwv1.Gateway, params config.ClassParams, res *translate.Result) (*appsv1.StatefulSet, error) {
+	if len(gw.Name) > maxGatewayNameLength {
+		return nil, &pendingError{fmt.Sprintf("Gateway names longer than %d characters are not supported: "+
+			"the name is used for the proxy StatefulSet and as a label value", maxGatewayNameLength)}
+	}
 	spec := &proxy.Spec{
 		Namespace: gw.Namespace,
 		Gateway:   gw.Name,
@@ -361,12 +416,12 @@ func (r *GatewayReconciler) provision(ctx context.Context, gw *gwv1.Gateway, par
 		return nil, err
 	}
 	for _, obj := range []client.Object{spec.ServiceAccount(), spec.Role(), spec.RoleBinding(), spec.ConfigMap(cfg)} {
-		if err := apply(ctx, r.Client, r.Scheme, obj); err != nil {
-			return nil, fmt.Errorf("applying %T %s: %w", obj, obj.GetName(), err)
+		if err := r.applyOwned(ctx, gw, obj); err != nil {
+			return nil, err
 		}
 	}
 	if pdb := spec.PodDisruptionBudget(); pdb != nil {
-		if err := apply(ctx, r.Client, r.Scheme, pdb); err != nil {
+		if err := r.applyOwned(ctx, gw, pdb); err != nil {
 			return nil, fmt.Errorf("applying PodDisruptionBudget: %w", err)
 		}
 	} else {
@@ -378,13 +433,42 @@ func (r *GatewayReconciler) provision(ctx context.Context, gw *gwv1.Gateway, par
 	if err := r.ensureStateSecrets(ctx, gw, params); err != nil {
 		return r.currentStatefulSet(ctx, gw), err
 	}
-	if err := apply(ctx, r.Client, r.Scheme, spec.StatefulSet()); err != nil {
-		return nil, fmt.Errorf("applying StatefulSet: %w", err)
+	if err := r.applyOwned(ctx, gw, spec.StatefulSet()); err != nil {
+		return nil, err
 	}
 	if err := r.pruneStateSecrets(ctx, gw, params.Replicas); err != nil {
 		return nil, err
 	}
 	return r.currentStatefulSet(ctx, gw), nil
+}
+
+// maxGatewayNameLength keeps the proxy StatefulSet's pods valid: their
+// controller-revision-hash label is "<name>-<10-character hash>", and label
+// values are limited to 63 characters.
+const maxGatewayNameLength = 52
+
+// applyOwned applies an object of the Gateway's data plane. An object of
+// the same name that the Gateway does not control is left alone: taking it
+// over would make it a child of the Gateway, and garbage collection would
+// delete it with the Gateway.
+func (r *GatewayReconciler) applyOwned(ctx context.Context, gw *gwv1.Gateway, obj client.Object) error {
+	gvk, err := apiutil.GVKForObject(obj, r.Scheme)
+	if err != nil {
+		return err
+	}
+	cur := obj.DeepCopyObject().(client.Object)
+	err = r.Get(ctx, client.ObjectKeyFromObject(obj), cur)
+	switch {
+	case apierrors.IsNotFound(err):
+	case err != nil:
+		return err
+	case !metav1.IsControlledBy(cur, gw):
+		return &pendingError{fmt.Sprintf("%s %s/%s exists and is not owned by this Gateway", gvk.Kind, obj.GetNamespace(), obj.GetName())}
+	}
+	if err := applyWithGVK(ctx, r.Client, obj, gvk); err != nil {
+		return fmt.Errorf("applying %s %s: %w", gvk.Kind, obj.GetName(), err)
+	}
+	return nil
 }
 
 func (r *GatewayReconciler) currentStatefulSet(ctx context.Context, gw *gwv1.Gateway) *appsv1.StatefulSet {
@@ -973,6 +1057,11 @@ func (r *GatewayReconciler) gatewaysForClass(ctx context.Context, obj client.Obj
 }
 
 func (r *GatewayReconciler) gatewaysForParamsConfigMap(ctx context.Context, obj client.Object) []reconcile.Request {
+	if l := obj.GetLabels(); l[proxy.LabelName] == proxy.AppName && l[proxy.LabelManagedBy] == proxy.ManagedBy {
+		// A serve config changed: other Gateways may gain or lose a
+		// Tailscale Service name (see claimedServices).
+		return r.managedGateways(ctx)
+	}
 	var out []reconcile.Request
 	for _, req := range classesForConfigMap(r.Client, r.Config.ControllerName)(ctx, obj) {
 		gc := &gwv1.GatewayClass{}
