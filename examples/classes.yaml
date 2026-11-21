@@ -1,0 +1,44 @@
+# Two classes with different tags and replica counts. The OAuth client must
+# own both tags through tagOwners.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tailnet-prod
+  namespace: tailnet-gateway-system
+data:
+  tags: tag:prod
+  replicas: "3"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: tailnet-prod
+spec:
+  controllerName: tailnet-gateway.davy.tw/gateway-controller
+  parametersRef:
+    group: ""
+    kind: ConfigMap
+    name: tailnet-prod
+    namespace: tailnet-gateway-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tailnet-dev
+  namespace: tailnet-gateway-system
+data:
+  tags: tag:dev
+  replicas: "1"
+  drainGracePeriod: 10s
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: tailnet-dev
+spec:
+  controllerName: tailnet-gateway.davy.tw/gateway-controller
+  parametersRef:
+    group: ""
+    kind: ConfigMap
+    name: tailnet-dev
+    namespace: tailnet-gateway-system
