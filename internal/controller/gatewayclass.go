@@ -73,6 +73,21 @@ func (e *invalidParamsError) Error() string { return e.msg }
 // defaults. An *invalidParamsError means the class is invalid; other errors
 // are transient.
 func (r *classResolver) classParams(ctx context.Context, gc *gwv1.GatewayClass) (config.ClassParams, []string, error) {
+	p, unknown, err := r.resolveParams(ctx, gc)
+	if err != nil {
+		return p, unknown, err
+	}
+	// The Tailscale API refuses to mint a key with no tags for an OAuth
+	// client, so such a class could never start a proxy.
+	if r.Config.OAuthEnabled() && len(p.Tags) == 0 {
+		return config.ClassParams{}, nil, &invalidParamsError{fmt.Sprintf(
+			"no tags: auth keys minted with an OAuth client must be tagged; set %s on the controller or %q in the class parameters",
+			config.EnvTags, config.ParamTags)}
+	}
+	return p, unknown, nil
+}
+
+func (r *classResolver) resolveParams(ctx context.Context, gc *gwv1.GatewayClass) (config.ClassParams, []string, error) {
 	ref := gc.Spec.ParametersRef
 	if ref == nil {
 		return r.Config.Defaults, nil, nil

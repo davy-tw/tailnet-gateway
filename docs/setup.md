@@ -38,8 +38,9 @@ kubectl -n tailnet-gateway-system rollout restart deployment/tailnet-gateway
 The controller reads these settings at start-up, so restart it whenever the
 Secret is created or changed.
 
-`PROXY_TAGS` may be left out: the keys then carry the OAuth client's own tags.
-Per-class tags go in the GatewayClass parameters (see the README).
+`PROXY_TAGS` is required: the Tailscale API only mints tagged keys for an
+OAuth client. It may be left out only if every GatewayClass sets `tags` in
+its parameters (see the README); a class left with no tags is not accepted.
 
 ### Without an OAuth client (manual key mode)
 

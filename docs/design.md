@@ -46,7 +46,7 @@ loaded from an optional Secret in the controller's namespace.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | OAuth client ID and secret | unset | Used to mint auth keys and delete devices. Without them the controller runs in manual key mode |
-| Device tags (per class) | unset | Comma-separated tags requested on minted keys. Unset lets the OAuth client's own tags apply |
+| Device tags (per class) | unset | Comma-separated tags requested on minted keys. Required with an OAuth client, as a default or per class |
 | Proxy replicas (per class) | `2` | Proxy pods per Gateway, from 1 to 64 |
 | Proxy image (per class) | a pinned `tailscale/tailscale` tag | At least v1.86.0, the first release that can host Tailscale Services |
 | Drain grace period (per class) | `30s` | Pod termination grace period, covering the drain |
@@ -76,8 +76,13 @@ reusable, ephemeral, pre-authorized, tagged key.
 
 Tags decide what a proxy may do on the tailnet, so they belong to whoever
 owns the GatewayClass (a cluster-scoped object, normally the platform
-admin), not to whoever creates a Gateway. When tags are set, every minted
-key requests them, and they must be tags the OAuth client may assign. When
+admin), not to whoever creates a Gateway. Every minted key requests the
+class's tags, and they must be tags the OAuth client may assign. The
+Tailscale API mints no untagged keys for an OAuth client, so with an OAuth
+client a class that ends up with no tags (no default and none in its
+parameters) is `Accepted=False` with reason `InvalidParameters`, and the
+controller logs a warning at start-up when the default is empty. Manual key
+mode has no such check: the user's key carries its own tags. When
 the Tailscale API rejects key creation, its error is shown on the Gateway's
 `Programmed` condition.
 
@@ -96,6 +101,8 @@ keys, each optional and falling back to the controller default: `tags`,
   replicas come back as the same devices.
 - A valid class is `Accepted=True`. The controller watches the ConfigMap and
   re-reconciles the class's Gateways when it changes.
+- An empty value counts as unset and keeps the default, so a class cannot
+  clear the default tags.
 - Changing `tags` only affects keys minted afterwards. Existing devices keep
   their tags until their state Secret is deleted.
 - Gateways cannot override class parameters. Per-Gateway overrides through
