@@ -135,41 +135,54 @@ func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''
 // servicesInConfig lists the "svc:" names in the mounted serve config.
 const servicesInConfig = `grep -o '"svc:[a-z0-9-]*"' "$CFG" 2>/dev/null | tr -d '"' | sort -u`
 
-// AdvertiseScript waits for tailscaled to be up, then advertises every
-// Tailscale Service in the serve config.
-func AdvertiseScript() string {
-	return strings.Join([]string{
-		"CFG=" + shellQuote(ServeConfigDir+"/"+ServeConfigKey),
-		"TS=" + shellQuote("tailscale --socket="+SocketPath),
-		`i=0; while [ $i -lt 90 ]; do $TS status >/dev/null 2>&1 && break; i=$((i+1)); sleep 2; done`,
-		`for s in $(` + servicesInConfig + `); do $TS serve advertise "$s" || true; done`,
-		`exit 0`,
-	}, "\n")
-}
+// advertisedServices lists the "svc:" names the replica advertises, from
+// the AdvertiseServices field of its prefs (printed as indented JSON).
+const advertisedServices = `$TS debug prefs 2>/dev/null | tr -d ' \t\n' | grep -o '"AdvertiseServices":\[[^]]*\]' | grep -o '"svc:[a-z0-9-]*"' | tr -d '"' | sort -u`
 
-// ReadyScript succeeds once tailscaled is up and runs the mounted serve
-// config: an IP alone does not mean the replica serves the current config.
-// The two JSON documents are compared by their strings (keys, hostnames,
-// paths and targets), which catches any change of backend, path, port or
-// mode; the mounted file is written with the same field names.
+// DrainingMarker is created by the preStop hook, so that the readiness
+// probe stops advertising Services while the replica drains.
+const DrainingMarker = "/tmp/tailnet-gateway-draining"
+
+// ReadyScript reports a replica ready once tailscaled is up, runs the
+// mounted serve config and advertises exactly the Tailscale Services in it.
+//
+// The serve configs are compared by their strings (keys, hostnames, paths
+// and targets), which catches any change of backend, path, port or mode;
+// the mounted file is written with the same field names. An IP alone does
+// not mean the replica serves the current config.
+//
+// Advertisement is reconciled here too, once the config is applied: names
+// added to the config are advertised and names removed from it are
+// drained. The image only advertises the Services of the config it starts
+// with, so without this a Gateway change that adds a Service would never
+// be advertised. A draining replica (see DrainingMarker) is not ready and
+// advertises nothing.
 func ReadyScript() string {
 	return strings.Join([]string{
 		"CFG=" + shellQuote(ServeConfigDir+"/"+ServeConfigKey),
 		"TS=" + shellQuote("tailscale --socket="+SocketPath),
+		`[ -e ` + shellQuote(DrainingMarker) + ` ] && exit 1`,
 		`$TS status >/dev/null 2>&1 || exit 1`,
 		`want=$(grep -o '"[^"]*"' "$CFG" | sort -u)`,
 		`have=$($TS serve status --json 2>/dev/null | grep -o '"[^"]*"' | sort -u)`,
-		`[ "$want" = "$have" ]`,
+		`[ "$want" = "$have" ] || exit 1`,
+		`want=$(` + servicesInConfig + `)`,
+		`have=$(` + advertisedServices + `)`,
+		`[ "$want" = "$have" ] && exit 0`,
+		`for s in $want; do printf '%s\n' "$have" | grep -qxF "$s" || $TS serve advertise "$s"; done`,
+		`for s in $have; do printf '%s\n' "$want" | grep -qxF "$s" || $TS serve drain "$s"; done`,
+		`[ "$want" = "$(` + advertisedServices + `)" ]`,
 	}, "\n")
 }
 
-// DrainScript drains every Tailscale Service, then waits so that open
-// connections can finish before the container is stopped.
+// DrainScript stops advertising every Tailscale Service, then waits so that
+// open connections can finish before the container is stopped.
 func DrainScript(waitSeconds int64) string {
 	return strings.Join([]string{
 		"CFG=" + shellQuote(ServeConfigDir+"/"+ServeConfigKey),
 		"TS=" + shellQuote("tailscale --socket="+SocketPath),
-		`for s in $(` + servicesInConfig + `); do $TS serve drain "$s" || true; done`,
+		`touch ` + shellQuote(DrainingMarker),
+		`for s in $(` + servicesInConfig + `; ` + advertisedServices + `); do $TS serve drain "$s" || true; done`,
 		fmt.Sprintf("sleep %d", waitSeconds),
 		`exit 0`,
 	}, "\n")
@@ -203,6 +216,10 @@ func (s *Spec) StatefulSet() *appsv1.StatefulSet {
 		{Name: "TS_SERVE_CONFIG", Value: ServeConfigDir + "/" + ServeConfigKey},
 		{Name: "TS_SOCKET", Value: SocketPath},
 		{Name: "TS_AUTH_ONCE", Value: "true"},
+		// The readiness probe owns advertisement (see ReadyScript). The
+		// image's own would only follow the config it starts with, and
+		// could advertise again while the preStop hook drains.
+		{Name: "TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT", Value: "false"},
 	}
 	selector := &metav1.LabelSelector{MatchLabels: SelectorLabels(s.Gateway)}
 	return &appsv1.StatefulSet{
@@ -255,8 +272,7 @@ func (s *Spec) StatefulSet() *appsv1.StatefulSet {
 							FailureThreshold: 2,
 						},
 						Lifecycle: &corev1.Lifecycle{
-							PostStart: &corev1.LifecycleHandler{Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", AdvertiseScript()}}},
-							PreStop:   &corev1.LifecycleHandler{Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", DrainScript(wait)}}},
+							PreStop: &corev1.LifecycleHandler{Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", DrainScript(wait)}}},
 						},
 						SecurityContext: &corev1.SecurityContext{
 							AllowPrivilegeEscalation: ptr.To(false),
