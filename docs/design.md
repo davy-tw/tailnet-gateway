@@ -292,11 +292,27 @@ proxy: there is no data plane per ListenerSet.
   with reason `NotAllowed`, and their listeners are not used.
 - Listeners are merged in the Gateway API precedence order: the Gateway's
   own, then ListenerSets oldest first, then by namespace/name. A ListenerSet
-  listener that conflicts with an earlier one (another protocol on the same
-  port, or the same protocol, port and hostname) gets `Accepted=False`,
-  `Conflicted=True` and `Programmed=False` with reason `ProtocolConflict` or
-  `HostnameConflict`, and the earlier listener keeps serving. Conflicts
-  among the Gateway's own listeners still leave all of them out.
+  listener that conflicts with an earlier one gets `Accepted=False`,
+  `Conflicted=True` and `Programmed=False` with reason `ProtocolConflict`
+  (another protocol family on the same port) or `HostnameConflict` (the
+  same port and the same hostname, compared by the Tailscale Service it
+  names, so `admin` and `admin.<tailnet>.ts.net` are the same), and the
+  earlier listener keeps serving. Conflicts among the Gateway's own
+  listeners still leave all of them out, but their ports stay reserved for
+  the Gateway.
+- A Tailscale Service name is shared on every port, so it belongs to one
+  owner of the Gateway: the Gateway or one ListenerSet. Owners are settled
+  in precedence order. The Gateway holds its default Service (its name),
+  its listener hostnames, and every name its routes use; then each
+  ListenerSet in turn holds its listener hostnames and the names its routes
+  use, if no earlier owner holds them. A ListenerSet listener whose
+  hostname names an earlier owner's Service gets `HostnameConflict`, on any
+  port and protocol, and a route that would add to another owner's Service
+  through a ListenerSet gets `Accepted=False` with reason `Conflicted`,
+  whatever the route's age. A route that already uses a name may still use
+  it through its other parentRefs. This keeps one namespace that a
+  Gateway allows from taking or extending a Service of the Gateway's owner
+  or of another namespace.
 - A ListenerSet is `Accepted=True` when at least one of its listeners is
   valid (reason `ListenersNotValid` when some are not), and
   `Accepted=False` with `ListenersNotValid` when none is, or with
@@ -310,11 +326,18 @@ proxy: there is no data plane per ListenerSet.
   Gateway's own listeners only through a parentRef to the Gateway. The
   route's status entry names the parent it used. `allowedRoutes` with
   `from: Same` on a ListenerSet listener means the ListenerSet's namespace.
-- Tailscale Service names work as for the Gateway's own listeners; a route
-  without hostnames on a listener without a hostname still uses the
-  Gateway's name.
+- A route without hostnames on a ListenerSet listener without a hostname
+  has no Tailscale Service name: it gets `Accepted=False` with reason
+  `UnsupportedValue` instead of falling back to the Gateway's default
+  Service. Either side must set a hostname.
 - When the Gateway is deleted, or its GatewayClass disappears, its
-  ListenerSets get `Accepted=False` with reason `ParentNotAccepted`.
+  ListenerSets get `Accepted=False` with reason `ParentNotAccepted`. The
+  Gateway records the ListenerSets it wrote status for in its
+  `tailnet-gateway.davy.tw/listener-sets` annotation, so that one whose
+  `parentRef` moves to a Gateway that does not exist also gets
+  `ParentNotAccepted`, and one that moves to another controller's Gateway
+  goes back to `Unknown`/`Pending`, unless its status was already written
+  for its new generation.
 - Listener `certificateRefs` are ignored on ListenerSets too, so no
   ReferenceGrant is checked for them.
 

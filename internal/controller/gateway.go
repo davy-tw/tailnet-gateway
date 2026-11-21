@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -116,6 +117,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		orig := gw.DeepCopy()
 		controllerutil.RemoveFinalizer(gw, config.Finalizer)
 		delete(gw.Annotations, config.AnnotationDevices)
+		delete(gw.Annotations, config.AnnotationListenerSets)
 		return ctrl.Result{}, client.IgnoreNotFound(r.Patch(ctx, gw, client.MergeFrom(orig)))
 	}
 	if !controllerutil.ContainsFinalizer(gw, config.Finalizer) {
@@ -191,6 +193,9 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 	statusErr = errors.Join(statusErr, r.writeListenerSetStatus(ctx, gw, sets.of(gw), res, ip))
+	if r.Features.ListenerSet {
+		statusErr = errors.Join(statusErr, r.releaseMovedListenerSets(ctx, gw, sets))
+	}
 	if statusErr != nil {
 		return ctrl.Result{}, statusErr
 	}
@@ -1549,23 +1554,94 @@ func (r *GatewayReconciler) releaseListenerSets(ctx context.Context, gw *gwv1.Ga
 	}
 	var errs []error
 	for _, ls := range sets.of(gw) {
-		orig := ls.DeepCopy()
-		for _, c := range []metav1.Condition{
-			{Type: string(gwv1.ListenerSetConditionAccepted), Reason: string(gwv1.ListenerSetReasonParentNotAccepted)},
-			{Type: string(gwv1.ListenerSetConditionProgrammed), Reason: reasonParentNotProgrammed},
-		} {
-			c.Status, c.Message, c.ObservedGeneration = metav1.ConditionFalse, why, ls.Generation
-			meta.SetStatusCondition(&ls.Status.Conditions, c)
-		}
-		ls.Status.Listeners = nil
-		if listenerSetStatusEqual(&orig.Status, &ls.Status) {
-			continue
-		}
-		if err := r.Status().Patch(ctx, ls, client.MergeFrom(orig)); client.IgnoreNotFound(err) != nil {
-			errs = append(errs, err)
-		}
+		errs = append(errs, r.releaseListenerSet(ctx, ls, metav1.ConditionFalse,
+			string(gwv1.ListenerSetReasonParentNotAccepted), reasonParentNotProgrammed, why))
 	}
 	return errors.Join(errs...)
+}
+
+// releaseListenerSet sets a ListenerSet's Accepted and Programmed
+// conditions and drops its listener status.
+func (r *GatewayReconciler) releaseListenerSet(ctx context.Context, ls *gwv1.ListenerSet, status metav1.ConditionStatus, acceptedReason, programmedReason, why string) error {
+	orig := ls.DeepCopy()
+	for _, c := range []metav1.Condition{
+		{Type: string(gwv1.ListenerSetConditionAccepted), Reason: acceptedReason},
+		{Type: string(gwv1.ListenerSetConditionProgrammed), Reason: programmedReason},
+	} {
+		c.Status, c.Message, c.ObservedGeneration = status, why, ls.Generation
+		meta.SetStatusCondition(&ls.Status.Conditions, c)
+	}
+	ls.Status.Listeners = nil
+	if listenerSetStatusEqual(&orig.Status, &ls.Status) {
+		return nil
+	}
+	return client.IgnoreNotFound(r.Status().Patch(ctx, ls, client.MergeFrom(orig)))
+}
+
+// releaseMovedListenerSets hands back ListenerSets whose status gw wrote
+// but whose parentRef now names another Gateway that no Gateway of this
+// controller serves: one that does not exist gets ParentNotAccepted,
+// another controller's gets the "waiting for controller" conditions the
+// CRD starts with. Status that is already about the ListenerSet's current
+// generation was written after the move, by whoever serves it now, and is
+// left alone. The ListenerSets gw serves are then recorded on gw.
+func (r *GatewayReconciler) releaseMovedListenerSets(ctx context.Context, gw *gwv1.Gateway, sets listenerSets) error {
+	var current []string
+	for _, ls := range sets.of(gw) {
+		current = append(current, ls.Namespace+"/"+ls.Name)
+	}
+	var errs []error
+	for _, k := range strings.Split(gw.Annotations[config.AnnotationListenerSets], ",") {
+		ns, name, ok := strings.Cut(k, "/")
+		if !ok || slices.Contains(current, k) {
+			continue
+		}
+		ls := sets[types.NamespacedName{Namespace: ns, Name: name}]
+		if ls == nil {
+			continue // deleted
+		}
+		if c := meta.FindStatusCondition(ls.Status.Conditions, string(gwv1.ListenerSetConditionAccepted)); c == nil || c.ObservedGeneration >= ls.Generation {
+			continue
+		}
+		parent, ok := listenerSetGateway(ls)
+		if !ok {
+			continue
+		}
+		other := &gwv1.Gateway{}
+		switch err := r.Get(ctx, parent, other); {
+		case apierrors.IsNotFound(err):
+			errs = append(errs, r.releaseListenerSet(ctx, ls, metav1.ConditionFalse, string(gwv1.ListenerSetReasonParentNotAccepted),
+				reasonParentNotProgrammed, fmt.Sprintf("Gateway %s not found", parent)))
+		case err != nil:
+			errs = append(errs, err)
+		default:
+			gc, err := r.managedClass(ctx, string(other.Spec.GatewayClassName))
+			switch {
+			case err != nil:
+				errs = append(errs, err)
+			case gc == nil:
+				errs = append(errs, r.releaseListenerSet(ctx, ls, metav1.ConditionUnknown, string(gwv1.ListenerSetReasonPending),
+					string(gwv1.ListenerSetReasonPending), "Waiting for controller"))
+			}
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err // keep the record and retry
+	}
+	value := strings.Join(current, ",")
+	if gw.Annotations[config.AnnotationListenerSets] == value {
+		return nil
+	}
+	orig := gw.DeepCopy()
+	if value == "" {
+		delete(gw.Annotations, config.AnnotationListenerSets)
+	} else {
+		if gw.Annotations == nil {
+			gw.Annotations = map[string]string{}
+		}
+		gw.Annotations[config.AnnotationListenerSets] = value
+	}
+	return r.Patch(ctx, gw, client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{}))
 }
 
 func listenerSetStatusEqual(a, b *gwv1.ListenerSetStatus) bool {

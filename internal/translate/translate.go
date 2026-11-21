@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/utils/ptr"
 	gwv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"go.pkgs.davy.tw/tailnet-gateway/internal/config"
@@ -165,6 +166,10 @@ func Translate(in *Input) *Result {
 		services: map[string]*svcState{},
 		policies: map[types.NamespacedName]*policyState{},
 		sets:     map[types.NamespacedName]*setState{},
+
+		labelOwner:    map[string]int{},
+		labelRoutes:   map[string]map[RouteRef]bool{},
+		parentResults: map[RouteRef]map[int]ParentResult{},
 	}
 	return t.run()
 }
@@ -180,6 +185,19 @@ type translator struct {
 	// precedence order.
 	sets     map[types.NamespacedName]*setState
 	setOrder []*setState
+	// labelOwner maps a Tailscale Service label to the rank of the
+	// listener owner it belongs to: 0 for the Gateway, then the allowed
+	// ListenerSets in precedence order. A label is shared on every port,
+	// so one owner holds it on all of them.
+	labelOwner map[string]int
+	// labelRoutes records the routes placed on each label.
+	labelRoutes map[string]map[RouteRef]bool
+	// earlier holds the accepted listeners that later ListenerSet
+	// listeners must not conflict with.
+	earlier []*listenerState
+	// parentResults collects route results per parentRef index while
+	// routes are processed owner by owner.
+	parentResults map[RouteRef]map[int]ParentResult
 }
 
 type listenerState struct {
@@ -199,11 +217,21 @@ type listenerState struct {
 	conflicted bool
 }
 
+// rank is the precedence of the listener's owner: 0 for the Gateway.
+func (ls *listenerState) rank() int {
+	if ls.set == nil {
+		return 0
+	}
+	return ls.set.rank
+}
+
 type setState struct {
 	ls        *gwv1.ListenerSet
 	allowed   bool
 	accepted  bool
 	listeners []*listenerState
+	// rank orders allowed ListenerSets after the Gateway (from 1).
+	rank int
 }
 
 type svcState struct {
@@ -241,8 +269,20 @@ func (t *translator) gen() int64 { return t.in.Gateway.Generation }
 
 func (t *translator) run() *Result {
 	t.buildListeners()
-	t.buildListenerSets()
-	t.processRoutes()
+	// Owners go in precedence order: the Gateway's listeners and routes,
+	// then each allowed ListenerSet's listeners and routes. Everything an
+	// earlier owner uses (ports, Tailscale Service names) is settled before
+	// a later owner's listeners are checked against it.
+	t.prepareListenerSets()
+	routed := t.collectRoutes()
+	t.processRank(routed, 0)
+	for _, ss := range t.setOrder {
+		if ss.allowed {
+			t.buildSetListeners(ss)
+			t.processRank(routed, ss.rank)
+		}
+	}
+	t.assembleRoutes(routed)
 
 	res := &Result{
 		Config:     t.renderConfig(),
@@ -332,6 +372,16 @@ func (t *translator) buildListeners() {
 			portFamilies[l.Port] = map[string]bool{}
 		}
 		portFamilies[l.Port][protocolFamily(l.Protocol)] = true
+	}
+	// The Gateway's default Service (routes without hostnames on listeners
+	// without one) and its listener hostnames belong to the Gateway.
+	if l, err := ServiceLabel(gw.Name, t.in.TailnetDomain); err == nil {
+		t.labelOwner[l] = 0
+	}
+	for _, l := range gw.Spec.Listeners {
+		if label := t.listenerLabel(l.Hostname); label != "" {
+			t.labelOwner[label] = 0
+		}
 	}
 	for _, l := range gw.Spec.Listeners {
 		ls := t.newListener(l, gw.Namespace, nil, t.gen())
@@ -481,17 +531,36 @@ func entryListener(e gwv1.ListenerEntry) gwv1.Listener {
 	return gwv1.Listener{Name: e.Name, Hostname: e.Hostname, Port: e.Port, Protocol: e.Protocol, TLS: e.TLS, AllowedRoutes: e.AllowedRoutes}
 }
 
-func hostnameKey(h *gwv1.Hostname) string {
+// listenerLabel returns the Tailscale Service label a listener hostname
+// maps to, or "" when it has no hostname or the hostname cannot name one.
+func (t *translator) listenerLabel(h *gwv1.Hostname) string {
+	if h == nil || *h == "" {
+		return ""
+	}
+	l, err := ServiceLabel(string(*h), t.in.TailnetDomain)
+	if err != nil {
+		return ""
+	}
+	return l
+}
+
+// hostnameKey compares listener hostnames by the Tailscale Service they
+// name ("admin" and "admin.<tailnet>.ts.net" are the same), or by the
+// normalized hostname when they name none.
+func (t *translator) hostnameKey(h *gwv1.Hostname) string {
+	if l := t.listenerLabel(h); l != "" {
+		return "svc:" + l
+	}
 	if h == nil {
 		return ""
 	}
-	return strings.ToLower(string(*h))
+	return strings.TrimSuffix(strings.ToLower(string(*h)), ".")
 }
 
 // conflictWith returns the conflict reason and message when l cannot be
 // served next to an earlier listener: another protocol family on the same
-// port, or the same protocol and hostname on the same port.
-func conflictWith(l gwv1.Listener, earlier []*listenerState) (gwv1.ListenerConditionReason, string) {
+// port, or the same protocol family and hostname on the same port.
+func (t *translator) conflictWith(l gwv1.Listener, earlier []*listenerState) (gwv1.ListenerConditionReason, string) {
 	for _, e := range earlier {
 		if e.l.Port != l.Port {
 			continue
@@ -499,11 +568,24 @@ func conflictWith(l gwv1.Listener, earlier []*listenerState) (gwv1.ListenerCondi
 		if e.family != protocolFamily(l.Protocol) {
 			return gwv1.ListenerReasonProtocolConflict, fmt.Sprintf("port %d is already used with protocol %s by %s", l.Port, e.l.Protocol, e.describe())
 		}
-		if e.l.Protocol == l.Protocol && hostnameKey(e.l.Hostname) == hostnameKey(l.Hostname) {
-			return gwv1.ListenerReasonHostnameConflict, fmt.Sprintf("port %d and hostname %q are already used by %s", l.Port, hostnameKey(l.Hostname), e.describe())
+		if t.hostnameKey(e.l.Hostname) == t.hostnameKey(l.Hostname) {
+			return gwv1.ListenerReasonHostnameConflict, fmt.Sprintf("port %d and hostname %q are already used by %s", l.Port, ptr.Deref(l.Hostname, ""), e.describe())
 		}
 	}
 	return "", ""
+}
+
+// ownerName describes the listener owner of a rank.
+func (t *translator) ownerName(rank int) string {
+	if rank == 0 {
+		return fmt.Sprintf("Gateway %s/%s", t.in.Gateway.Namespace, t.in.Gateway.Name)
+	}
+	for _, ss := range t.setOrder {
+		if ss.allowed && ss.rank == rank {
+			return fmt.Sprintf("ListenerSet %s/%s", ss.ls.Namespace, ss.ls.Name)
+		}
+	}
+	return "another listener owner"
 }
 
 func (ls *listenerState) describe() string {
@@ -518,7 +600,7 @@ func (ls *listenerState) describe() string {
 // then ListenerSets by creation time, then by namespace/name. A listener
 // that conflicts with an earlier one is not accepted; the earlier one
 // keeps serving.
-func (t *translator) buildListenerSets() {
+func (t *translator) prepareListenerSets() {
 	var sets []*gwv1.ListenerSet
 	for _, ls := range t.in.ListenerSets {
 		if listenerSetParent(ls, t.in.Gateway) {
@@ -532,40 +614,62 @@ func (t *translator) buildListenerSets() {
 		}
 		return a.Namespace+"/"+a.Name < b.Namespace+"/"+b.Name
 	})
-	var earlier []*listenerState
+	// The Gateway's listeners keep their ports even when they conflict
+	// among themselves: those ports were declared by the Gateway's owner.
 	for _, ls := range t.listeners {
-		if ls.accepted && !ls.conflicted {
-			earlier = append(earlier, ls)
+		if ls.accepted {
+			t.earlier = append(t.earlier, ls)
 		}
 	}
+	rank := 0
 	for _, ls := range sets {
 		ss := &setState{ls: ls, allowed: t.listenerSetAllowed(ls)}
 		key := types.NamespacedName{Namespace: ls.Namespace, Name: ls.Name}
 		t.sets[key] = ss
 		t.setOrder = append(t.setOrder, ss)
-		if !ss.allowed {
-			continue
+		if ss.allowed {
+			rank++
+			ss.rank = rank
 		}
-		for _, e := range ls.Spec.Listeners {
-			l := entryListener(e)
-			st := t.newListener(l, ls.Namespace, ss, ls.Generation)
-			if st.accepted {
-				if reason, msg := conflictWith(l, earlier); reason != "" {
-					st.conflicted = true
-					st.res.Valid = false
-					st.res.InvalidReason = string(reason)
-					replaceCond(&st.res.Conditions, cond(gwv1.ListenerConditionAccepted, false, reason, msg, ls.Generation))
-					replaceCond(&st.res.Conditions, cond(gwv1.ListenerConditionConflicted, true, reason, msg, ls.Generation))
-				} else {
-					earlier = append(earlier, st)
-				}
+	}
+}
+
+// buildSetListeners adds an allowed ListenerSet's listeners. A listener
+// that conflicts with an earlier one (same port), or whose hostname names
+// a Tailscale Service an earlier owner uses (any port), is not accepted.
+func (t *translator) buildSetListeners(ss *setState) {
+	ls, rank := ss.ls, ss.rank
+	for _, e := range ls.Spec.Listeners {
+		l := entryListener(e)
+		st := t.newListener(l, ls.Namespace, ss, ls.Generation)
+		if st.accepted {
+			reason, msg := t.conflictWith(l, t.earlier)
+			label := t.listenerLabel(l.Hostname)
+			if owner, ok := t.labelOwner[label]; reason == "" && label != "" && ok && owner != rank {
+				// A Tailscale Service is shared on every port: a
+				// hostname that names another owner's Service is
+				// taken, whatever the port or protocol.
+				reason = gwv1.ListenerReasonHostnameConflict
+				msg = fmt.Sprintf("hostname %q names svc:%s, which belongs to %s", ptr.Deref(l.Hostname, ""), label, t.ownerName(owner))
 			}
-			ss.listeners = append(ss.listeners, st)
-			if st.res.Valid {
-				ss.accepted = true
+			if reason == "" && label != "" {
+				t.labelOwner[label] = rank
 			}
-			t.listeners = append(t.listeners, st)
+			if reason != "" {
+				st.conflicted = true
+				st.res.Valid = false
+				st.res.InvalidReason = string(reason)
+				replaceCond(&st.res.Conditions, cond(gwv1.ListenerConditionAccepted, false, reason, msg, ls.Generation))
+				replaceCond(&st.res.Conditions, cond(gwv1.ListenerConditionConflicted, true, reason, msg, ls.Generation))
+			} else {
+				t.earlier = append(t.earlier, st)
+			}
 		}
+		ss.listeners = append(ss.listeners, st)
+		if st.res.Valid {
+			ss.accepted = true
+		}
+		t.listeners = append(t.listeners, st)
 	}
 }
 
@@ -628,12 +732,29 @@ type routeItem struct {
 type routeCtx struct {
 	t    *translator
 	item *routeItem
+	// rank is the listener owner whose parentRefs this pass handles.
+	rank int
 	// rule-level problems, independent of the parent
 	unsupported []string
 	unresolved  []string
 	resolvedWhy gwv1.RouteConditionReason
 	// set when no rule could be programmed for unsupported reasons
 	nothingUsable bool
+}
+
+// mine reports whether this pass handles the parentRef.
+func (rc *routeCtx) mine(p gwv1.ParentReference) bool {
+	return rc.t.parentRank(p, rc.item.ref.Namespace) == rc.rank
+}
+
+// record stores the result for the parentRef at index i.
+func (rc *routeCtx) record(i int, pr ParentResult) {
+	m := rc.t.parentResults[rc.item.ref]
+	if m == nil {
+		m = map[int]ParentResult{}
+		rc.t.parentResults[rc.item.ref] = m
+	}
+	m[i] = pr
 }
 
 func (rc *routeCtx) unsupportedf(format string, args ...any) {
@@ -647,7 +768,7 @@ func (rc *routeCtx) unresolvedf(reason gwv1.RouteConditionReason, format string,
 	rc.unresolved = append(rc.unresolved, fmt.Sprintf(format, args...))
 }
 
-func (t *translator) processRoutes() {
+func (t *translator) collectRoutes() []*routeItem {
 	var items []*routeItem
 	for _, r := range t.in.HTTPRoutes {
 		items = append(items, &routeItem{ref: RouteRef{KindHTTPRoute, r.Namespace, r.Name}, created: r.CreationTimestamp,
@@ -683,12 +804,62 @@ func (t *translator) processRoutes() {
 		}
 		return a.ref.Kind < b.ref.Kind
 	})
+	var routed []*routeItem
 	for _, it := range items {
-		if !t.referencesGateway(it.parents, it.ref.Namespace) {
-			continue
+		if t.referencesGateway(it.parents, it.ref.Namespace) {
+			routed = append(routed, it)
 		}
-		it.process(&routeCtx{t: t, item: it})
 	}
+	return routed
+}
+
+// processRank places the routes of one listener owner, oldest first.
+// Routes are placed owner by owner, the Gateway first, so that a
+// higher-precedence owner's routes take Tailscale Service names, paths and
+// ports before routes of later ListenerSets, whatever their age.
+func (t *translator) processRank(routed []*routeItem, rank int) {
+	for _, it := range routed {
+		if t.hasParentOfRank(it, rank) {
+			it.process(&routeCtx{t: t, item: it, rank: rank})
+		}
+	}
+}
+
+// assembleRoutes puts each route's parent results in parentRef order.
+func (t *translator) assembleRoutes(routed []*routeItem) {
+	for _, it := range routed {
+		rr := RouteResult{Ref: it.ref}
+		for i := range it.parents {
+			if pr, ok := t.parentResults[it.ref][i]; ok {
+				rr.Parents = append(rr.Parents, pr)
+			}
+		}
+		t.routes = append(t.routes, rr)
+	}
+}
+
+// parentRank returns the owner rank a parentRef names, or -1 when it names
+// neither the Gateway nor one of its allowed ListenerSets. ListenerSets the
+// Gateway does not allow are handled with the Gateway (rank 0), which
+// only reports them.
+func (t *translator) parentRank(p gwv1.ParentReference, routeNS string) int {
+	set, ok := t.parentOwner(p, routeNS)
+	switch {
+	case !ok:
+		return -1
+	case set == nil || !set.allowed:
+		return 0
+	}
+	return set.rank
+}
+
+func (t *translator) hasParentOfRank(it *routeItem, rank int) bool {
+	for _, p := range it.parents {
+		if t.parentRank(p, it.ref.Namespace) == rank {
+			return true
+		}
+	}
+	return false
 }
 
 // parentOwner reports whether a parentRef names the Gateway (set is nil)
@@ -1275,14 +1446,13 @@ func (rc *routeCtx) grpcRoute(r *gwv1.GRPCRoute) {
 
 func (rc *routeCtx) finishHTTPLike(hostnames []gwv1.Hostname, mounts []httpMount) {
 	t := rc.t
-	rr := RouteResult{Ref: rc.item.ref}
-	for _, p := range rc.item.parents {
-		if !t.parentTargetsGateway(p, rc.item.ref.Namespace) {
+	for i, p := range rc.item.parents {
+		if !rc.mine(p) {
 			continue
 		}
 		atts, reason, msg := rc.attach(p, hostnames, true)
 		if atts == nil {
-			rr.Parents = append(rr.Parents, rc.parentResult(p, false, reason, msg, nil))
+			rc.record(i, rc.parentResult(p, false, reason, msg, nil))
 			continue
 		}
 		var labelErr string
@@ -1291,6 +1461,12 @@ func (rc *routeCtx) finishHTTPLike(hostnames []gwv1.Hostname, mounts []httpMount
 		for _, a := range atts {
 			hosts := a.hostnames
 			var labels []string
+			if len(hosts) == 0 && a.ls.set != nil {
+				// The Gateway's default Service belongs to the Gateway.
+				labelErr = fmt.Sprintf("listener %q of ListenerSet %s/%s has no hostname and the route has none: "+
+					"set hostnames on the route or the listener to name a Tailscale Service", a.ls.l.Name, a.ls.set.ls.Namespace, a.ls.set.ls.Name)
+				continue
+			}
 			if len(hosts) == 0 {
 				l, err := ServiceLabel(t.in.Gateway.Name, t.in.TailnetDomain)
 				if err != nil {
@@ -1318,7 +1494,7 @@ func (rc *routeCtx) finishHTTPLike(hostnames []gwv1.Hostname, mounts []httpMount
 			}
 			for _, label := range dedupe(labels) {
 				for _, m := range mounts {
-					if c := t.addMount(label, uint16(a.ls.l.Port), mode, m, rc.item.ref); c != "" {
+					if c := t.addMount(label, rc.rank, uint16(a.ls.l.Port), mode, m, rc.item.ref); c != "" {
 						conflicts = append(conflicts, c)
 					} else {
 						placed++
@@ -1327,7 +1503,7 @@ func (rc *routeCtx) finishHTTPLike(hostnames []gwv1.Hostname, mounts []httpMount
 			}
 		}
 		if attached == 0 {
-			rr.Parents = append(rr.Parents, rc.parentResult(p, false, gwv1.RouteReasonUnsupportedValue, labelErr, nil))
+			rc.record(i, rc.parentResult(p, false, gwv1.RouteReasonUnsupportedValue, labelErr, nil))
 			continue
 		}
 		extra := conflicts
@@ -1335,12 +1511,11 @@ func (rc *routeCtx) finishHTTPLike(hostnames []gwv1.Hostname, mounts []httpMount
 			extra = append(extra, labelErr)
 		}
 		if len(mounts) > 0 && placed == 0 && len(conflicts) > 0 {
-			rr.Parents = append(rr.Parents, rc.parentResult(p, false, ReasonConflicted, strings.Join(dedupe(conflicts), "; "), nil))
+			rc.record(i, rc.parentResult(p, false, ReasonConflicted, strings.Join(dedupe(conflicts), "; "), nil))
 			continue
 		}
-		rr.Parents = append(rr.Parents, rc.parentResult(p, true, "", "", dedupe(extra)))
+		rc.record(i, rc.parentResult(p, true, "", "", dedupe(extra)))
 	}
-	t.routes = append(t.routes, rr)
 }
 
 func (t *translator) svc(label string) *svcState {
@@ -1360,9 +1535,33 @@ func (t *translator) claimed(label string) string {
 	return ""
 }
 
+// ownLabel takes label for the owner of rank, or returns a conflict
+// message when another owner of the Gateway (the Gateway itself or another
+// ListenerSet) holds it.
+//
+// A route that already uses label through one parent may use it through
+// another: it adds nothing that is not its own.
+func (t *translator) ownLabel(label string, rank int, route RouteRef) string {
+	owner, ok := t.labelOwner[label]
+	if ok && owner != rank && !t.labelRoutes[label][route] {
+		return fmt.Sprintf("svc:%s belongs to %s", label, t.ownerName(owner))
+	}
+	if !ok {
+		t.labelOwner[label] = rank
+	}
+	if t.labelRoutes[label] == nil {
+		t.labelRoutes[label] = map[RouteRef]bool{}
+	}
+	t.labelRoutes[label][route] = true
+	return ""
+}
+
 // addMount places an HTTP mount; it returns a conflict message or "".
-func (t *translator) addMount(label string, port uint16, mode string, m httpMount, owner RouteRef) string {
+func (t *translator) addMount(label string, rank int, port uint16, mode string, m httpMount, owner RouteRef) string {
 	if c := t.claimed(label); c != "" {
+		return c
+	}
+	if c := t.ownLabel(label, rank, owner); c != "" {
 		return c
 	}
 	s := t.svc(label)
@@ -1446,14 +1645,13 @@ func (rc *routeCtx) singleBackend(rules [][]gwv1.BackendRef) *backend {
 
 func (rc *routeCtx) finishStream(hostnames []gwv1.Hostname, useHostnames bool, defaultLabel string, b *backend) {
 	t := rc.t
-	rr := RouteResult{Ref: rc.item.ref}
-	for _, p := range rc.item.parents {
-		if !t.parentTargetsGateway(p, rc.item.ref.Namespace) {
+	for i, p := range rc.item.parents {
+		if !rc.mine(p) {
 			continue
 		}
 		atts, reason, msg := rc.attach(p, hostnames, useHostnames)
 		if atts == nil {
-			rr.Parents = append(rr.Parents, rc.parentResult(p, false, reason, msg, nil))
+			rc.record(i, rc.parentResult(p, false, reason, msg, nil))
 			continue
 		}
 		var problems, conflicts []string
@@ -1492,7 +1690,7 @@ func (rc *routeCtx) finishStream(hostnames []gwv1.Hostname, useHostnames bool, d
 				mode = "tls"
 			}
 			for _, l := range dedupe(valid) {
-				if c := t.addStream(l, uint16(a.ls.l.Port), mode, hostPort(b), rc.item.ref); c != "" {
+				if c := t.addStream(l, rc.rank, uint16(a.ls.l.Port), mode, hostPort(b), rc.item.ref); c != "" {
 					conflicts = append(conflicts, c)
 				} else {
 					placed++
@@ -1501,20 +1699,22 @@ func (rc *routeCtx) finishStream(hostnames []gwv1.Hostname, useHostnames bool, d
 		}
 		switch {
 		case attached == 0:
-			rr.Parents = append(rr.Parents, rc.parentResult(p, false, gwv1.RouteReasonUnsupportedValue, strings.Join(problems, "; "), nil))
+			rc.record(i, rc.parentResult(p, false, gwv1.RouteReasonUnsupportedValue, strings.Join(problems, "; "), nil))
 		case b != nil && placed == 0 && len(conflicts) > 0:
-			rr.Parents = append(rr.Parents, rc.parentResult(p, false, ReasonConflicted, strings.Join(dedupe(conflicts), "; "), nil))
+			rc.record(i, rc.parentResult(p, false, ReasonConflicted, strings.Join(dedupe(conflicts), "; "), nil))
 		default:
-			rr.Parents = append(rr.Parents, rc.parentResult(p, true, "", "", dedupe(append(conflicts, problems...))))
+			rc.record(i, rc.parentResult(p, true, "", "", dedupe(append(conflicts, problems...))))
 		}
 	}
-	t.routes = append(t.routes, rr)
 }
 
 func hostPort(b *backend) string { return b.host + ":" + strconv.Itoa(int(b.port)) }
 
-func (t *translator) addStream(label string, port uint16, mode, target string, owner RouteRef) string {
+func (t *translator) addStream(label string, rank int, port uint16, mode, target string, owner RouteRef) string {
 	if c := t.claimed(label); c != "" {
+		return c
+	}
+	if c := t.ownLabel(label, rank, owner); c != "" {
 		return c
 	}
 	s := t.svc(label)
@@ -1529,19 +1729,16 @@ func (t *translator) addStream(label string, port uint16, mode, target string, o
 }
 
 func (rc *routeCtx) udpRoute() {
-	t := rc.t
-	rr := RouteResult{Ref: rc.item.ref}
-	for _, p := range rc.item.parents {
-		if !t.parentTargetsGateway(p, rc.item.ref.Namespace) {
+	for i, p := range rc.item.parents {
+		if !rc.mine(p) {
 			continue
 		}
-		rr.Parents = append(rr.Parents, ParentResult{ParentRef: p, Conditions: []metav1.Condition{
+		rc.record(i, ParentResult{ParentRef: p, Conditions: []metav1.Condition{
 			cond(gwv1.RouteConditionAccepted, false, gwv1.RouteReasonUnsupportedValue,
 				"UDPRoute is not supported: Tailscale Services carry TCP only", rc.item.generation),
 			cond(gwv1.RouteConditionResolvedRefs, true, gwv1.RouteReasonResolvedRefs, "", rc.item.generation),
 		}})
 	}
-	t.routes = append(t.routes, rr)
 }
 
 // parentResult builds the conditions for one parentRef.

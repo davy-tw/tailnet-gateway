@@ -42,6 +42,11 @@ const (
 	// deletion).
 	AnnotationDevices = Domain + "/devices"
 
+	// AnnotationListenerSets on a Gateway lists the ListenerSets
+	// ("namespace/name") whose status it wrote, so that one that moves to
+	// a Gateway no Gateway of this controller serves can be released.
+	AnnotationListenerSets = Domain + "/listener-sets"
+
 	LabelSourceKind = Domain + "/source-kind"
 	LabelSourceName = Domain + "/source-name"
 
