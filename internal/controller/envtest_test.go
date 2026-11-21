@@ -855,16 +855,22 @@ func TestEnvtestDeletionSafety(t *testing.T) {
 	})
 
 	// The class disappears (say, a reinstall that forces it away): the
-	// Gateway stops serving but keeps its devices and state.
+	// Gateway stops serving but keeps its devices and state. The class is
+	// deleted first and its finalizer removed afterwards: removed first,
+	// the controller could put it back before the delete.
 	gc := &gwv1.GatewayClass{}
 	_ = e.get("", "tailnet", gc)
-	gc.Finalizers = nil
-	if err := e.c.Update(e.ctx, gc); err != nil {
-		t.Fatal(err)
-	}
 	if err := e.c.Delete(e.ctx, gc); err != nil {
 		t.Fatal(err)
 	}
+	e.eventually("class finalizer removed by hand", func() error {
+		gc := &gwv1.GatewayClass{}
+		if err := e.get("", "tailnet", gc); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		gc.Finalizers = nil
+		return e.c.Update(e.ctx, gc)
+	})
 	e.eventually("gateway withdrawn", func() error {
 		g := &gwv1.Gateway{}
 		if err := e.get("d", "gw", g); err != nil {
