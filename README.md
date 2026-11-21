@@ -181,7 +181,9 @@ RBAC as `dist/install.yaml`.
 to GHCR:
 
 - every push to `main`: image `ghcr.io/davy-tw/tailnet-gateway/controller:main` and
-  `:sha-<commit>`;
+  `:sha-<commit>`, and chart `oci://ghcr.io/davy-tw/charts/tailnet-gateway`
+  version `0.0.0-main.<commit>` using that image (a prerelease: Helm only
+  picks it when asked for that version);
 - every tag `vX.Y.Z`: image `:X.Y.Z`, `:X.Y` and `:latest` (amd64 and arm64),
   chart `oci://ghcr.io/davy-tw/charts/tailnet-gateway` version `X.Y.Z`, and a
   GitHub release with the chart and an `install.yaml` pinned to that image.
