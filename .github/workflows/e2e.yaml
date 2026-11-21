@@ -14,6 +14,7 @@ concurrency:
   cancel-in-progress: true
 env:
   GATEWAY_API_VERSION: v1.6.3
+  K3S_VERSION: v1.34.1-k3s1
   IMAGE: ghcr.io/davy-tw/tailnet-gateway:e2e
 jobs:
   e2e:
@@ -43,7 +44,8 @@ jobs:
         if: matrix.cluster == 'k3s'
         run: |
           go install github.com/k3d-io/k3d/v5@v5.8.3
-          k3d cluster create e2e --wait --timeout 180s
+          # A binary built with go install has no default k3s version.
+          k3d cluster create e2e --image "rancher/k3s:${K3S_VERSION}" --wait --timeout 180s
           k3d image import "$IMAGE" --cluster e2e
       - name: install Gateway API and the controller
         run: |
