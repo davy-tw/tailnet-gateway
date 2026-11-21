@@ -1,8 +1,9 @@
 name: ci
+# Runs on pull requests, and from the release workflow before anything is
+# published (pushes to main and tags).
 on:
-  push:
-    branches: [main]
   pull_request:
+  workflow_call:
 permissions:
   contents: read
 jobs:

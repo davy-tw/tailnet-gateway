@@ -1,17 +1,19 @@
 name: e2e
 # Runs test/e2e on kind (upstream Kubernetes) and on k3s through k3d, with
 # the controller installed from the chart and no tailnet (see
-# `make e2e-kind` and `make e2e-k3d`).
+# `make e2e-kind` and `make e2e-k3d`). Runs on pull requests, and from the
+# release workflow before anything is published (pushes to main and tags).
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 permissions:
   contents: read
 concurrency:
-  group: e2e-${{ github.ref }}
-  cancel-in-progress: true
+  # github.workflow is the caller's name when called from release, so a
+  # release run never cancels (or waits for) a pull request run.
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   e2e:
     name: e2e (${{ matrix.provider }}, Gateway API ${{ matrix.gateway-api }})
