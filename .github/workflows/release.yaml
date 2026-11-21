@@ -1,5 +1,6 @@
 name: release
-# Publishes the controller image and Helm chart to GHCR.
+# Publishes the controller image and Helm chart to GHCR, only after the
+# ci and e2e workflows pass for the same commit.
 #
 # - Every push to main: image tags `main` and `sha-<short sha>`, and the
 #   chart as version 0.0.0-main.<short sha> pointing at that image.
@@ -26,8 +27,17 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/tailnet-gateway/controller
   CHART_REPO: oci://ghcr.io/${{ github.repository_owner }}/charts
 jobs:
+  ci:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yaml
+
+  e2e:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/e2e.yaml
+
   image:
     if: github.event_name == 'push'
+    needs: [ci, e2e]
     runs-on: ubuntu-latest
     permissions:
       contents: read
