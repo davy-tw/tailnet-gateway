@@ -177,8 +177,9 @@ RBAC as `dist/install.yaml`.
 
 ### Releases
 
-[`.github/workflows/release.yaml`](.github/workflows/release.yaml) publishes
-to GHCR:
+[`.github/workflows/release.yaml`](.github/workflows/release.yaml) first runs
+the ci and e2e workflows on the commit, and only if both pass publishes to
+GHCR:
 
 - every push to `main`: image `ghcr.io/davy-tw/tailnet-gateway/controller:main` and
   `:sha-<commit>`, and chart `oci://ghcr.io/davy-tw/charts/tailnet-gateway`
