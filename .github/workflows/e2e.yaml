@@ -1,7 +1,7 @@
 name: e2e
-# Installs the controller with the Helm chart on kind and on k3s (through
-# k3d) and runs test/e2e without a tailnet: the controller runs in manual
-# key mode with a fake auth key, so proxies start but never log in.
+# Runs test/e2e on kind (upstream Kubernetes) and on k3s through k3d, with
+# the controller installed from the chart and no tailnet (see
+# `make e2e-kind` and `make e2e-k3d`).
 on:
   push:
     branches: [main]
@@ -12,57 +12,39 @@ permissions:
 concurrency:
   group: e2e-${{ github.ref }}
   cancel-in-progress: true
-env:
-  GATEWAY_API_VERSION: v1.6.3
-  K3S_VERSION: v1.34.1-k3s1
-  IMAGE: ghcr.io/davy-tw/tailnet-gateway:e2e
 jobs:
   e2e:
+    name: e2e (${{ matrix.provider }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        cluster: [kind, k3s]
+        provider: [kind, k3d]
+    env:
+      KIND_VERSION: v0.30.0
+      K3D_VERSION: v5.9.0
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
       - uses: azure/setup-helm@v4
         with:
           version: v3.19.0
-      - name: build image
-        run: docker build -t "$IMAGE" .
-      - name: create kind cluster
-        if: matrix.cluster == 'kind'
+      - name: install kind
+        if: matrix.provider == 'kind'
         run: |
-          go install sigs.k8s.io/kind@v0.30.0
-          kind create cluster --name e2e --wait 120s
-          kind load docker-image "$IMAGE" --name e2e
-      - name: create k3s cluster
-        if: matrix.cluster == 'k3s'
+          curl -fsSLo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-$(go env GOARCH)"
+          chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
+          kind version
+      - name: install k3d
+        if: matrix.provider == 'k3d'
         run: |
-          go install github.com/k3d-io/k3d/v5@v5.8.3
-          # A binary built with go install has no default k3s version.
-          k3d cluster create e2e --image "rancher/k3s:${K3S_VERSION}" --wait --timeout 180s
-          k3d image import "$IMAGE" --cluster e2e
-      - name: install Gateway API and the controller
-        run: |
-          kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
-          kubectl wait --for condition=Established crd --all --timeout 60s
-          helm install tailnet-gateway charts/tailnet-gateway \
-            --namespace tailnet-gateway-system --create-namespace \
-            --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE##*:}" --set image.pullPolicy=Never \
-            --set proxy.drainGracePeriod=5s \
-            --wait --timeout 3m
-      - name: e2e tests
-        env:
-          E2E_AUTHKEY: tskey-auth-e2e-not-a-real-key
-        run: go test -tags e2e ./test/e2e/ -v -count=1 -timeout 20m
-      - name: diagnostics
-        if: failure()
-        run: |
-          kubectl get gatewayclasses,gateways,httproutes,tcproutes,ingresses,statefulsets,pods -A -o wide || true
-          kubectl -n tailnet-gateway-system logs deployment/tailnet-gateway --tail=300 || true
-          kubectl get events -A --sort-by=.lastTimestamp | tail -80 || true
+          curl -fsSLo ./k3d "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-$(go env GOARCH)"
+          chmod +x ./k3d && sudo mv ./k3d /usr/local/bin/k3d
+          k3d version
+      - name: e2e
+        run: make "e2e-${{ matrix.provider }}"
