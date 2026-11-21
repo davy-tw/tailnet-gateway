@@ -1,0 +1,25 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        run: make vet
+      - name: install bundle is up to date
+        run: make manifests && git diff --exit-code dist/
+      - name: tests (unit + envtest)
+        run: make test-envtest
+      - name: build image
+        run: docker build .
