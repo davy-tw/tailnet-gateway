@@ -35,6 +35,8 @@ KIND ?= kind
 K3D ?= k3d
 KIND_CLUSTER ?= tailnet-gateway-e2e
 K3D_CLUSTER ?= tailnet-gateway-e2e
+# k3s's bundled Traefik is disabled: the tests do not need an ingress
+# controller, and it would only compete for the Gateway API CRDs.
 # K3S_IMAGE pins the k3s version the k3d cluster runs (a k3d built from
 # source has no default and falls back to an old one).
 K3S_IMAGE ?= rancher/k3s:v1.37.2-k3s1
@@ -55,7 +57,8 @@ e2e-kind:
 e2e-k3d:
 	@command -v $(K3D) >/dev/null || { echo "k3d is not installed"; exit 1; }
 	docker build -t $(E2E_IMG) .
-	$(K3D) cluster get $(K3D_CLUSTER) >/dev/null 2>&1 || $(K3D) cluster create $(K3D_CLUSTER) --image $(K3S_IMAGE) --wait --timeout 5m
+	$(K3D) cluster get $(K3D_CLUSTER) >/dev/null 2>&1 || $(K3D) cluster create $(K3D_CLUSTER) --image $(K3S_IMAGE) \
+		--k3s-arg "--disable=traefik@server:*" --wait --timeout 5m
 	$(K3D) image import $(E2E_IMG) --cluster $(K3D_CLUSTER)
 	kubectl config use-context k3d-$(K3D_CLUSTER)
 	$(MAKE) e2e-install
@@ -63,8 +66,8 @@ e2e-k3d:
 	[ "$(E2E_KEEP)" = 1 ] || $(K3D) cluster delete $(K3D_CLUSTER)
 
 # Installs the Gateway API CRDs and the chart into the current context.
-# --force-conflicts: k3s's bundled Traefik may already have applied
-# Gateway API CRDs.
+# --force-conflicts: on a k3s cluster that runs its bundled Traefik (k3d
+# disables it above), Traefik may already have applied Gateway API CRDs.
 e2e-install:
 	kubectl apply --server-side --force-conflicts -f https://github.com/kubernetes-sigs/gateway-api/releases/download/$(GATEWAY_API_VERSION)/standard-install.yaml
 	kubectl wait --for condition=Established crd --all --timeout 60s
