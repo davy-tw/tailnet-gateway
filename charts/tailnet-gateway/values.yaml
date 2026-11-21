@@ -47,6 +47,8 @@ controller:
 # Defaults for the proxies; a GatewayClass parametersRef can override them.
 proxy:
   # Comma-separated tags requested on minted keys (for example tag:k8s).
+  # Required with an OAuth client, unless every GatewayClass sets tags in
+  # its parameters.
   tags: ""
   replicas: ""
   image: ""

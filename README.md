@@ -75,7 +75,7 @@ defaults that a GatewayClass can override.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TAILSCALE_OAUTH_CLIENT_ID`, `TAILSCALE_OAUTH_CLIENT_SECRET` | unset | OAuth client for minting auth keys and deleting devices. Without them the controller runs in manual key mode |
-| `PROXY_TAGS` (per class) | unset | Comma-separated tags requested on minted keys. Unset: the OAuth client's tags apply |
+| `PROXY_TAGS` (per class) | unset | Comma-separated tags requested on minted keys. Required with an OAuth client, here or in every class's parameters: a class that ends up with no tags is `Accepted=False` (`InvalidParameters`) |
 | `PROXY_REPLICAS` (per class) | `2` | Proxy pods per Gateway (1 to 64) |
 | `PROXY_IMAGE` (per class) | `tailscale/tailscale:v1.104.7` | Proxy image |
 | `PROXY_DRAIN_GRACE_PERIOD` (per class) | `30s` | Pod termination grace period, covering the drain |
@@ -96,7 +96,8 @@ and `drainGracePeriod`. Invalid values set `Accepted=False` with reason
 `InvalidParameters` on the class, and its Gateways stop serving until the
 class is valid again. See
 `examples/classes.yaml`. Tags are under the class owner's control: Gateways
-cannot override them.
+cannot override them. An empty value keeps the controller default, so a
+class cannot clear `PROXY_TAGS`.
 
 ### Annotations
 

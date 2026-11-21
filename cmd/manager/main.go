@@ -80,6 +80,10 @@ func main() {
 	var ts tailscale.API
 	if cfg.OAuthEnabled() {
 		ts = tailscale.NewOAuthClient(cfg.TailscaleAPIURL, cfg.OAuthClientID, cfg.OAuthClientSecret)
+		if len(cfg.Defaults.Tags) == 0 {
+			setupLog.Info("WARNING: " + config.EnvTags + " is empty; only GatewayClasses whose parameters set tags are accepted " +
+				"(auth keys minted with an OAuth client must be tagged)")
+		}
 	} else {
 		setupLog.Info("WARNING: no Tailscale OAuth client configured; running in manual key mode. " +
 			"Each Gateway needs a Secret of the same name with an 'authkey', and devices are not deleted on Gateway deletion.")
