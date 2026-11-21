@@ -53,7 +53,7 @@ func TestStatefulSet(t *testing.T) {
 	if c.SecurityContext.Capabilities.Add != nil || c.SecurityContext.Capabilities.Drop[0] != "ALL" {
 		t.Errorf("capabilities = %+v", c.SecurityContext.Capabilities)
 	}
-	if !strings.Contains(c.Lifecycle.PreStop.Exec.Command[2], "serve drain") || !strings.Contains(c.Lifecycle.PreStop.Exec.Command[2], "sleep 25") {
+	if pre := c.Lifecycle.PreStop.Exec.Command[2]; !strings.Contains(pre, "serve drain") || !strings.Contains(pre, "sleep 11\n") || !strings.Contains(pre, "sleep 14\n") {
 		t.Errorf("preStop = %s", c.Lifecycle.PreStop.Exec.Command[2])
 	}
 	if psc := pod.SecurityContext; psc == nil || !*psc.RunAsNonRoot || *psc.RunAsUser == 0 || psc.SeccompProfile.Type != "RuntimeDefault" {
@@ -92,9 +92,14 @@ shift # --socket
 case "$1 $2" in
 "status "*) [ -e "$D/up" ] ;;
 "serve status") cat "$D/running.json" ;;
-"serve advertise") grep -qxF "$3" "$D/adv" 2>/dev/null || echo "$3" >> "$D/adv"; echo "advertise $3" >> "$D/log" ;;
-"serve drain") grep -vxF "$3" "$D/adv" > "$D/adv.new" 2>/dev/null; mv "$D/adv.new" "$D/adv"; echo "drain $3" >> "$D/log" ;;
+"serve advertise") [ -e "$D/stop-advertise" ] && exit 3; grep -qxF "$3" "$D/adv" 2>/dev/null || echo "$3" >> "$D/adv"; echo "advertise $3" >> "$D/log" ;;
+"serve drain") grep -vxF "$3" "$D/adv" > "$D/adv.new" 2>/dev/null; mv "$D/adv.new" "$D/adv"; echo "drain $3" >> "$D/log"
+	# A write lost to a concurrent probe: the first drain is undone.
+	[ -e "$D/undo-drain" ] && { rm "$D/undo-drain"; echo "$3" >> "$D/adv"; } ;;
 "debug prefs")
+	# A hook run once, to act between the probe's steps.
+	[ -x "$D/on-prefs" ] && { mv "$D/on-prefs" "$D/on-prefs.done"; "$D/on-prefs.done"; }
+	[ -e "$D/old-prefs" ] && { printf '{\n\t"WantRunning": true\n}\n'; exit 0; }
 	printf '{\n\t"WantRunning": true,\n\t"AdvertiseServices": '
 	if [ -s "$D/adv" ]; then printf '[\n'; sed 's/.*/\t\t"&"/' "$D/adv" | paste -sd, -; printf '\t]'; else printf 'null'; fi
 	printf ',\n\t"Hostname": "x"\n}\n' ;;
@@ -215,5 +220,77 @@ func TestReadyScriptReconcilesAdvertisement(t *testing.T) {
 	}
 	if p.run(ready) || p.read("adv") != "" {
 		t.Fatalf("probe acted while draining: ready, advertised %q", p.read("adv"))
+	}
+}
+
+// The preStop race: a probe run that passed the marker check before preStop
+// created it must not advertise again, and a drain lost to a concurrent
+// probe write is repeated once the probe run is over.
+func TestDrainRacesWithProbe(t *testing.T) {
+	if _, err := exec.LookPath("paste"); err != nil {
+		t.Skip("paste not available")
+	}
+	p := newProxySim(t)
+	p.write("up", "")
+	p.write("mounted.json", serveJSON("svc:a", "svc:b"))
+	p.write("running.json", serveJSON("svc:a", "svc:b"))
+	p.write("adv", "svc:a\n")
+
+	// preStop runs while the probe is between its marker check and its
+	// prefs read: the probe sees svc:b missing but must not advertise it.
+	p.write("on-prefs", "#!/bin/sh\ntouch "+filepath.Join(p.dir, "draining")+"\n")
+	if err := os.Chmod(filepath.Join(p.dir, "on-prefs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if p.run(ReadyScript()) {
+		t.Fatal("ready while draining")
+	}
+	if got := p.read("adv"); got != "svc:a" {
+		t.Fatalf("probe advertised during drain: %q", got)
+	}
+
+	// The first drain's write is lost; the second one withdraws it.
+	p.write("undo-drain", "")
+	if !p.run(DrainScript(0)) {
+		t.Fatal("drain failed")
+	}
+	if got := p.read("adv"); got != "" {
+		t.Fatalf("still advertised after drain: %q", got)
+	}
+}
+
+// Until the mounted config runs, stale advertisements (in neither the
+// mounted nor the running config) are drained, and nothing is advertised.
+func TestReadyScriptDrainsStaleWhileConfigPending(t *testing.T) {
+	if _, err := exec.LookPath("paste"); err != nil {
+		t.Skip("paste not available")
+	}
+	p := newProxySim(t)
+	p.write("up", "")
+	p.write("mounted.json", serveJSON("svc:a", "svc:new"))
+	p.write("running.json", serveJSON("svc:a", "svc:old"))
+	p.write("adv", "svc:a\nsvc:old\nsvc:gone\n")
+	if p.run(ReadyScript()) {
+		t.Fatal("ready before the config runs")
+	}
+	if got := p.read("adv"); got != "svc:a\nsvc:old" {
+		t.Fatalf("advertised = %q, want only svc:gone drained", got)
+	}
+}
+
+// An image whose prefs output has no AdvertiseServices field must not be
+// read as "nothing advertised".
+func TestReadyScriptNeedsAdvertiseServicesField(t *testing.T) {
+	p := newProxySim(t)
+	p.write("up", "")
+	p.write("mounted.json", serveJSON("svc:a"))
+	p.write("running.json", serveJSON("svc:a"))
+	p.write("old-prefs", "")
+	p.write("stop-advertise", "")
+	if p.run(ReadyScript()) {
+		t.Fatal("ready without AdvertiseServices")
+	}
+	if got := p.read("log"); got != "" {
+		t.Fatalf("CLI changes made: %q", got)
 	}
 }

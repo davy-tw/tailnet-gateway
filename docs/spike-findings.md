@@ -55,4 +55,7 @@ Service VIP is the code exercised here.
    it was, so a new listener hostname is never advertised. The proxies
    therefore turn it off, and the readiness probe advertises and drains
    Services to match the running config (`tailscale debug prefs` shows the
-   `AdvertiseServices` list).
+   `AdvertiseServices` list as indented JSON; a debug command, so recheck
+   it on every image upgrade). `serve advertise` and `serve drain` each
+   read the prefs and write the whole list back, so concurrent calls can
+   undo each other.

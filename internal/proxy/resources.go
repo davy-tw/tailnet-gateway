@@ -132,16 +132,36 @@ func (s *Spec) PodDisruptionBudget() *policyv1.PodDisruptionBudget {
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
-// servicesInConfig lists the "svc:" names in the mounted serve config.
-const servicesInConfig = `grep -o '"svc:[a-z0-9-]*"' "$CFG" 2>/dev/null | tr -d '"' | sort -u`
-
-// advertisedServices lists the "svc:" names the replica advertises, from
-// the AdvertiseServices field of its prefs (printed as indented JSON).
-const advertisedServices = `$TS debug prefs 2>/dev/null | tr -d ' \t\n' | grep -o '"AdvertiseServices":\[[^]]*\]' | grep -o '"svc:[a-z0-9-]*"' | tr -d '"' | sort -u`
-
 // DrainingMarker is created by the preStop hook, so that the readiness
 // probe stops advertising Services while the replica drains.
 const DrainingMarker = "/tmp/tailnet-gateway-draining"
+
+// ProbeTimeoutSeconds bounds one readiness probe run. A run that adds
+// Services starts one CLI process per Service, so it gets more time than a
+// plain check would need.
+const ProbeTimeoutSeconds = 10
+
+// scriptPrelude defines the variables and helpers shared by the pod
+// scripts:
+//   - svcs: the sorted "svc:" names in its input;
+//   - has LIST NAME: whether the newline-separated LIST holds NAME;
+//   - advertised: the names in the AdvertiseServices prefs, or failure
+//     (with a message on stderr) when the prefs cannot be read or have no
+//     such field. "tailscale debug prefs" is a debug command, so its
+//     output (indented JSON in v1.104.7) is not a stable interface: a
+//     missing field must not be read as "nothing advertised".
+var scriptPrelude = []string{
+	"CFG=" + shellQuote(ServeConfigDir+"/"+ServeConfigKey),
+	"TS=" + shellQuote("tailscale --socket="+SocketPath),
+	"DRAINING=" + shellQuote(DrainingMarker),
+	`svcs() { grep -o '"svc:[a-z0-9-]*"' | tr -d '"' | sort -u; }`,
+	`has() { printf '%s\n' "$1" | grep -qxF "$2"; }`,
+	`advertised() {
+  p=$($TS debug prefs 2>/dev/null | tr -d ' \t\n')
+  case "$p" in *'"AdvertiseServices":'*) ;; *) echo "no AdvertiseServices field in tailscale debug prefs" >&2; return 1 ;; esac
+  printf '%s' "$p" | grep -o '"AdvertiseServices":\[[^]]*\]' | svcs
+}`,
+}
 
 // ReadyScript reports a replica ready once tailscaled is up, runs the
 // mounted serve config and advertises exactly the Tailscale Services in it.
@@ -151,41 +171,57 @@ const DrainingMarker = "/tmp/tailnet-gateway-draining"
 // the mounted file is written with the same field names. An IP alone does
 // not mean the replica serves the current config.
 //
-// Advertisement is reconciled here too, once the config is applied: names
-// added to the config are advertised and names removed from it are
-// drained. The image only advertises the Services of the config it starts
-// with, so without this a Gateway change that adds a Service would never
-// be advertised. A draining replica (see DrainingMarker) is not ready and
-// advertises nothing.
+// Advertisement is reconciled here too. The image only advertises the
+// Services of the config it starts with, so without this a Gateway change
+// that adds a Service would never be advertised.
+//   - Until the mounted config runs, only names in neither the mounted nor
+//     the running config are drained (stale ones, for example kept in the
+//     state Secret by a replica that was killed without its preStop hook).
+//   - Once it runs, the config's Services that are missing are advertised
+//     and the advertised ones no longer in it are drained.
+//
+// A draining replica (see DrainingMarker) is not ready and advertises
+// nothing; the marker is checked again right before each advertise.
 func ReadyScript() string {
-	return strings.Join([]string{
-		"CFG=" + shellQuote(ServeConfigDir+"/"+ServeConfigKey),
-		"TS=" + shellQuote("tailscale --socket="+SocketPath),
-		`[ -e ` + shellQuote(DrainingMarker) + ` ] && exit 1`,
+	return strings.Join(append(append([]string(nil), scriptPrelude...),
+		`[ -e "$DRAINING" ] && exit 1`,
 		`$TS status >/dev/null 2>&1 || exit 1`,
-		`want=$(grep -o '"[^"]*"' "$CFG" | sort -u)`,
-		`have=$($TS serve status --json 2>/dev/null | grep -o '"[^"]*"' | sort -u)`,
-		`[ "$want" = "$have" ] || exit 1`,
-		`want=$(` + servicesInConfig + `)`,
-		`have=$(` + advertisedServices + `)`,
-		`[ "$want" = "$have" ] && exit 0`,
-		`for s in $want; do printf '%s\n' "$have" | grep -qxF "$s" || $TS serve advertise "$s"; done`,
-		`for s in $have; do printf '%s\n' "$want" | grep -qxF "$s" || $TS serve drain "$s"; done`,
-		`[ "$want" = "$(` + advertisedServices + `)" ]`,
-	}, "\n")
+		`running=$($TS serve status --json 2>/dev/null)`,
+		`adv=$(advertised) || exit 1`,
+		`mounted=$(svcs < "$CFG")`,
+		`if [ "$(grep -o '"[^"]*"' "$CFG" | sort -u)" != "$(printf '%s' "$running" | grep -o '"[^"]*"' | sort -u)" ]; then`,
+		`  live=$(printf '%s' "$running" | svcs)`,
+		`  for s in $adv; do has "$mounted" "$s" || has "$live" "$s" || $TS serve drain "$s"; done`,
+		`  exit 1`,
+		`fi`,
+		`[ "$mounted" = "$adv" ] && exit 0`,
+		`for s in $mounted; do has "$adv" "$s" && continue; [ -e "$DRAINING" ] && exit 1; $TS serve advertise "$s"; done`,
+		`for s in $adv; do has "$mounted" "$s" || $TS serve drain "$s"; done`,
+		`[ "$mounted" = "$(advertised)" ]`,
+	), "\n")
 }
 
 // DrainScript stops advertising every Tailscale Service, then waits so that
 // open connections can finish before the container is stopped.
+//
+// A readiness probe that started before the marker was created may still
+// advertise a Service, or lose the drain's write (the CLI edits the whole
+// AdvertiseServices list). So the script drains, waits for any such probe
+// run to end (ProbeTimeoutSeconds), and drains again.
 func DrainScript(waitSeconds int64) string {
-	return strings.Join([]string{
-		"CFG=" + shellQuote(ServeConfigDir+"/"+ServeConfigKey),
-		"TS=" + shellQuote("tailscale --socket="+SocketPath),
-		`touch ` + shellQuote(DrainingMarker),
-		`for s in $(` + servicesInConfig + `; ` + advertisedServices + `); do $TS serve drain "$s" || true; done`,
-		fmt.Sprintf("sleep %d", waitSeconds),
+	settle := int64(ProbeTimeoutSeconds + 1)
+	if settle > waitSeconds {
+		settle = waitSeconds
+	}
+	drain := `for s in $( (svcs < "$CFG"; advertised) | sort -u); do $TS serve drain "$s" || true; done`
+	return strings.Join(append(append([]string(nil), scriptPrelude...),
+		`touch "$DRAINING"`,
+		drain,
+		fmt.Sprintf("sleep %d", settle),
+		drain,
+		fmt.Sprintf("sleep %d", waitSeconds-settle),
 		`exit 0`,
-	}, "\n")
+	), "\n")
 }
 
 // StatefulSet runs the proxy replicas.
@@ -268,7 +304,7 @@ func (s *Spec) StatefulSet() *appsv1.StatefulSet {
 								Command: []string{"/bin/sh", "-c", ReadyScript()},
 							}},
 							PeriodSeconds:    5,
-							TimeoutSeconds:   5,
+							TimeoutSeconds:   ProbeTimeoutSeconds,
 							FailureThreshold: 2,
 						},
 						Lifecycle: &corev1.Lifecycle{
