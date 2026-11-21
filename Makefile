@@ -50,8 +50,7 @@ e2e-kind:
 	$(KIND) get clusters | grep -qx $(KIND_CLUSTER) || $(KIND) create cluster --name $(KIND_CLUSTER) --wait 120s
 	$(KIND) load docker-image $(E2E_IMG) --name $(KIND_CLUSTER)
 	kubectl config use-context kind-$(KIND_CLUSTER)
-	$(MAKE) e2e-install
-	$(E2E_ENV) $(MAKE) e2e || { $(MAKE) e2e-diagnostics; [ "$(E2E_KEEP)" = 1 ] || $(KIND) delete cluster --name $(KIND_CLUSTER); exit 1; }
+	{ $(MAKE) e2e-install && $(E2E_ENV) $(MAKE) e2e; } || { $(MAKE) e2e-diagnostics; [ "$(E2E_KEEP)" = 1 ] || $(KIND) delete cluster --name $(KIND_CLUSTER); exit 1; }
 	[ "$(E2E_KEEP)" = 1 ] || $(KIND) delete cluster --name $(KIND_CLUSTER)
 
 e2e-k3d:
@@ -61,8 +60,7 @@ e2e-k3d:
 		--k3s-arg "--disable=traefik@server:*" --wait --timeout 5m
 	$(K3D) image import $(E2E_IMG) --cluster $(K3D_CLUSTER)
 	kubectl config use-context k3d-$(K3D_CLUSTER)
-	$(MAKE) e2e-install
-	$(E2E_ENV) $(MAKE) e2e || { $(MAKE) e2e-diagnostics; [ "$(E2E_KEEP)" = 1 ] || $(K3D) cluster delete $(K3D_CLUSTER); exit 1; }
+	{ $(MAKE) e2e-install && $(E2E_ENV) $(MAKE) e2e; } || { $(MAKE) e2e-diagnostics; [ "$(E2E_KEEP)" = 1 ] || $(K3D) cluster delete $(K3D_CLUSTER); exit 1; }
 	[ "$(E2E_KEEP)" = 1 ] || $(K3D) cluster delete $(K3D_CLUSTER)
 
 # Installs the Gateway API CRDs and the chart into the current context.
@@ -73,11 +71,12 @@ e2e-install:
 	kubectl wait --for condition=Established crd --all --timeout 60s
 	$(HELM) upgrade --install tailnet-gateway $(CHART) --namespace tailnet-gateway-system --create-namespace \
 		--set image.repository=$(firstword $(subst :, ,$(E2E_IMG))) --set image.tag=$(lastword $(subst :, ,$(E2E_IMG))) \
-		--set image.pullPolicy=Never --set proxy.drainGracePeriod=5s --wait --timeout 3m
+		--set image.pullPolicy=Never --set proxy.drainGracePeriod=5s --wait --timeout 5m
 
 e2e-diagnostics:
 	-kubectl get gatewayclasses,gateways,httproutes,tcproutes,ingresses,statefulsets,pods -A -o wide
-	-kubectl -n tailnet-gateway-system logs deployment/tailnet-gateway --tail=300
+	-kubectl -n tailnet-gateway-system describe pods
+	-kubectl -n tailnet-gateway-system logs deployment/tailnet-gateway --all-containers --tail=300
 	-kubectl get events -A --sort-by=.lastTimestamp | tail -80
 
 manifests:
