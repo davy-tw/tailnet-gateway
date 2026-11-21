@@ -173,6 +173,30 @@ With `CHART_MANIFESTS=$PWD/bin/chart.yaml`, `make test-envtest` also checks
 that the rendered chart validates against the API server and grants the same
 RBAC as `dist/install.yaml`.
 
+### Releases
+
+[`.github/workflows/release.yaml`](.github/workflows/release.yaml) publishes
+to GHCR:
+
+- every push to `main`: image `ghcr.io/davy-tw/tailnet-gateway:main` and
+  `:sha-<commit>`;
+- every tag `vX.Y.Z`: image `:X.Y.Z`, `:X.Y` and `:latest` (amd64 and arm64),
+  chart `oci://ghcr.io/davy-tw/charts/tailnet-gateway` version `X.Y.Z`, and a
+  GitHub release with the chart and an `install.yaml` pinned to that image.
+
+It can then deploy the release with `helm upgrade --install`. To turn that
+on, set the repository variable `DEPLOY_ENABLED=true` and add a `production`
+environment with a `KUBECONFIG` secret. The OAuth credentials stay in the
+cluster: create the Secret `tailnet-gateway` (or the one named by the
+variable `OAUTH_SECRET`) in the target namespace first. Optional variables:
+`DEPLOY_NAMESPACE` (default `tailnet-gateway-system`) and `HELM_VALUES` (a
+values file's contents). Running the workflow by hand with a version
+redeploys that version.
+
+[`docs/design.md`](docs/design.md) describes the design and its decisions.
+[`docs/spike-findings.md`](docs/spike-findings.md) records the prototype that validated direct proxying
+to cluster DNS names and gRPC through Tailscale Services.
+
 ## License
 
 Licensed under either of [MIT-0](LICENSE-MIT-0) or [Apache-2.0](LICENSE-APACHE), at your option
