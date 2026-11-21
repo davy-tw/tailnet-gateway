@@ -347,3 +347,34 @@ func TestListenerSetTCPRoute(t *testing.T) {
 		t.Errorf("config = %s", mustJSON(t, res.Config))
 	}
 }
+
+// TestListenerSetTLS covers the HTTPS and TLS passthrough listeners of
+// examples/listenerset.yaml.
+func TestListenerSetTLS(t *testing.T) {
+	secure := entry("secure", gwv1.HTTPSProtocolType, 443, "")
+	secure.TLS = &gwv1.ListenerTLSConfig{Mode: ptr.To(gwv1.TLSModeTerminate)}
+	pass := entry("passthrough", gwv1.TLSProtocolType, 8443, "")
+	pass.TLS = &gwv1.ListenerTLSConfig{Mode: ptr.To(gwv1.TLSModePassthrough)}
+	hr := httpRoute("infra", "team-secure", 1, []string{"team-secure"}, rule(backendRef("web", 80)))
+	hr.Spec.ParentRefs = []gwv1.ParentReference{setParent("infra", "team", "secure")}
+	tr := &gwv1.TLSRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "team-tls", Namespace: "infra", Generation: 1},
+		Spec: gwv1.TLSRouteSpec{CommonRouteSpec: gwv1.CommonRouteSpec{ParentRefs: []gwv1.ParentReference{setParent("infra", "team", "passthrough")}},
+			Hostnames: []gwv1.Hostname{"team-tls"}, Rules: []gwv1.TLSRouteRule{{BackendRefs: []gwv1.BackendRef{backendRef("web", 443)}}}},
+	}
+	res := Translate(&Input{
+		Gateway:       allowListeners(gateway(listener("http", gwv1.HTTPProtocolType, 80)), gwv1.NamespacesFromSame, nil),
+		TailnetDomain: domain,
+		ListenerSets:  []*gwv1.ListenerSet{listenerSet("infra", "team", 1, secure, pass)},
+		HTTPRoutes:    []*gwv1.HTTPRoute{hr},
+		TLSRoutes:     []*gwv1.TLSRoute{tr},
+	})
+	if svc := res.Config.Services["svc:team-secure"]; svc == nil || svc.TCP[443] == nil || !svc.TCP[443].HTTPS {
+		t.Errorf("config = %s", mustJSON(t, res.Config))
+	}
+	if svc := res.Config.Services["svc:team-tls"]; svc == nil || svc.TCP[8443] == nil ||
+		svc.TCP[8443].TCPForward != "web.infra.svc.cluster.local:443" || svc.TCP[8443].TerminateTLS != "" {
+		t.Errorf("config = %s", mustJSON(t, res.Config))
+	}
+	expectCond(t, routeConds(t, res, KindTLSRoute, "team-tls"), "Accepted", metav1.ConditionTrue, "Accepted")
+}
