@@ -467,8 +467,10 @@ as the same devices when the class is recreated.
   each release tag. A demo Gateway
   and HTTPRoute split `/api` and `/` across two backends for smoke tests.
 - Integration tests run against a real API server (envtest). End-to-end
-  tests run against a real cluster behind a build tag, so unit-test CI does
-  not need a cluster.
+  tests run against a real cluster behind a build tag. CI runs them on kind
+  and on k3s, installed with the Helm chart, without a tailnet: manual key
+  mode with a fake key checks admission under the restricted Pod Security
+  Standard, translation, and deletion with real garbage collection.
 
 ## Out of scope
 

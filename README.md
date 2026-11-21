@@ -164,7 +164,8 @@ and one state Secret `N-<i>` per replica.
 ```sh
 make test          # unit tests
 make test-envtest  # unit + integration tests against kube-apiserver/etcd
-make e2e           # against the current kubeconfig context (build tag e2e)
+make e2e           # against the current kubeconfig context (build tag e2e);
+                   # CI runs it on kind and k3s (.github/workflows/e2e.yaml)
 make manifests     # regenerate dist/install.yaml
 make chart-lint chart-render  # lint and render the Helm chart to bin/chart.yaml
 ```
