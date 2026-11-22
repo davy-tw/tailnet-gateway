@@ -84,3 +84,42 @@ func (c *Config) Labels() []string {
 	}
 	return names
 }
+
+// CertDomains returns the sorted server names that tailscaled needs a TLS
+// certificate for: the hosts of HTTPS ports and the names that TCP ports
+// terminate TLS for. Names outside *.ts.net (a tailnet domain not known
+// yet) are left out.
+func (c *Config) CertDomains() []string {
+	if c == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, svc := range c.Services {
+		for key := range svc.Web {
+			i := strings.LastIndexByte(key, ':')
+			if i < 0 {
+				continue
+			}
+			port, err := strconv.ParseUint(key[i+1:], 10, 16)
+			if err != nil {
+				continue
+			}
+			if h := svc.TCP[uint16(port)]; h != nil && h.HTTPS {
+				seen[key[:i]] = true
+			}
+		}
+		for _, h := range svc.TCP {
+			if h != nil && h.TerminateTLS != "" {
+				seen[h.TerminateTLS] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for d := range seen {
+		if strings.HasSuffix(d, ".ts.net") && !strings.HasPrefix(d, ".") {
+			out = append(out, d)
+		}
+	}
+	sort.Strings(out)
+	return out
+}

@@ -519,6 +519,17 @@ func (r *GatewayReconciler) provision(ctx context.Context, gw *gwv1.Gateway, par
 	services := append([]string(nil), res.Services...)
 	sort.Strings(services)
 	cm.Annotations = map[string]string{config.AnnotationTailscaleServices: strings.Join(services, ",")}
+	if params.CertificateSharing {
+		spec.CertDomains = res.Config.CertDomains()
+		if err := r.stripStateCerts(ctx, gw); err != nil {
+			return nil, err
+		}
+	}
+	// Before the Role, so that it never names a Secret the Gateway does
+	// not control.
+	if err := r.syncCertSecrets(ctx, gw, spec); err != nil {
+		return r.currentStatefulSet(ctx, gw), err
+	}
 	for _, obj := range []client.Object{spec.ServiceAccount(), spec.Role(), spec.RoleBinding(), cm} {
 		if err := r.applyOwned(ctx, gw, obj); err != nil {
 			return nil, err
@@ -840,8 +851,13 @@ func (r *GatewayReconciler) finalize(ctx context.Context, gw *gwv1.Gateway, unma
 			return false, err
 		}
 	}
-	for i := range secrets {
-		if err := r.Delete(ctx, &secrets[i]); client.IgnoreNotFound(err) != nil {
+	certs, err := r.certSecrets(ctx, gw)
+	if err != nil {
+		return false, err
+	}
+	all := append(secrets, certs...)
+	for i := range all {
+		if err := r.Delete(ctx, &all[i]); client.IgnoreNotFound(err) != nil {
 			return false, err
 		}
 	}

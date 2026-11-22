@@ -53,6 +53,11 @@ proxy:
   replicas: ""
   image: ""
   drainGracePeriod: ""
+  # "true" lets only replica 0 issue and renew TLS certificates and share
+  # them with the other replicas through one Secret per hostname, instead
+  # of every replica requesting its own. Uses Tailscale's experimental
+  # cert share mode, so it is off by default.
+  certificateSharing: ""
 
 # Classes installed with the chart.
 gatewayClass:

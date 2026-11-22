@@ -83,6 +83,62 @@ func TestRoleAndPDB(t *testing.T) {
 	}
 }
 
+func TestCertificateSharing(t *testing.T) {
+	envOf := func(s *Spec) map[string]string {
+		env := map[string]string{}
+		for _, e := range s.StatefulSet().Spec.Template.Spec.Containers[0].Env {
+			env[e.Name] = e.Value
+		}
+		return env
+	}
+	off := spec(2)
+	off.CertDomains = []string{"web.tail1234.ts.net"} // ignored while off
+	if _, ok := envOf(off)["TS_EXPERIMENTAL_CERT_SHARE"]; ok {
+		t.Error("cert share env set while off")
+	}
+	if got := strings.Join(off.Role().Rules[0].ResourceNames, ","); got != "gw-0,gw-1" {
+		t.Errorf("resourceNames while off = %s", got)
+	}
+
+	on := spec(2)
+	on.Params.CertificateSharing = true
+	on.CertDomains = []string{"web.tail1234.ts.net"}
+	if envOf(on)["TS_EXPERIMENTAL_CERT_SHARE"] != "true" {
+		t.Error("cert share env missing")
+	}
+	if got := strings.Join(on.Role().Rules[0].ResourceNames, ","); got != "gw-0,gw-1,web.tail1234.ts.net" {
+		t.Errorf("resourceNames = %s", got)
+	}
+	for _, r := range on.Role().Rules {
+		for _, v := range r.Verbs {
+			if v == "list" || v == "watch" || (v == "create" && r.Resources[0] == "secrets") {
+				t.Errorf("unexpected verb %s on %v", v, r.Resources)
+			}
+		}
+	}
+	if a := on.StatefulSet().Spec.Template.Annotations; a[AnnotationCertificates] != "" {
+		t.Errorf("annotations without a renewal = %v", a)
+	}
+	on.CertHash = "abc"
+	if a := on.StatefulSet().Spec.Template.Annotations; a[AnnotationCertificates] != "abc" {
+		t.Errorf("annotations = %v", a)
+	}
+
+	sec := on.CertSecret("web.tail1234.ts.net", "sum")
+	if sec.Name != "web.tail1234.ts.net" || sec.Namespace != "ns" || len(sec.Data) != 0 {
+		t.Errorf("cert Secret = %+v", sec.ObjectMeta)
+	}
+	for k, v := range map[string]string{LabelTailscaleSecretType: "certs", LabelTailscaleManaged: "true",
+		LabelTailscaleProxyGroup: "gw", LabelComponent: ComponentCertificate, LabelManagedBy: ManagedBy} {
+		if sec.Labels[k] != v {
+			t.Errorf("label %s = %q, want %q", k, sec.Labels[k], v)
+		}
+	}
+	if sec.Annotations[AnnotationIssuedCertificate] != "sum" {
+		t.Errorf("annotations = %v", sec.Annotations)
+	}
+}
+
 // fakeTailscale is a stand-in for the tailscale CLI that keeps its state
 // (running or not, the serve config it runs and the advertised Services) in
 // files under dir. "debug prefs" prints indented JSON, as the real CLI does.

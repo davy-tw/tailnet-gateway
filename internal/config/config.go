@@ -71,6 +71,11 @@ type ClassParams struct {
 	Replicas         int32
 	Image            string
 	DrainGracePeriod time.Duration
+	// CertificateSharing makes replica 0 the only replica that issues and
+	// renews TLS certificates. It stores them in one Secret per hostname,
+	// which the other replicas read. Off by default: it relies on
+	// Tailscale's experimental cert share mode.
+	CertificateSharing bool
 }
 
 // Config is the controller-wide configuration.
@@ -116,6 +121,7 @@ const (
 	EnvReplicas            = "PROXY_REPLICAS"
 	EnvDrainGracePeriod    = "PROXY_DRAIN_GRACE_PERIOD"
 	EnvImage               = "PROXY_IMAGE"
+	EnvCertificateSharing  = "PROXY_CERTIFICATE_SHARING"
 	EnvAuthKeyDescription  = "AUTH_KEY_DESCRIPTION"
 	EnvMetricsAddr         = "METRICS_BIND_ADDRESS"
 	EnvProbeAddr           = "HEALTH_PROBE_BIND_ADDRESS"
@@ -156,10 +162,11 @@ func Load(getenv func(string) string) (*Config, error) {
 		DrainGracePeriod: 30 * time.Second,
 	}
 	defaults, _, err := ParseClassParams(map[string]string{
-		ParamTags:             getenv(EnvTags),
-		ParamReplicas:         getenv(EnvReplicas),
-		ParamImage:            getenv(EnvImage),
-		ParamDrainGracePeriod: getenv(EnvDrainGracePeriod),
+		ParamTags:               getenv(EnvTags),
+		ParamReplicas:           getenv(EnvReplicas),
+		ParamImage:              getenv(EnvImage),
+		ParamDrainGracePeriod:   getenv(EnvDrainGracePeriod),
+		ParamCertificateSharing: getenv(EnvCertificateSharing),
 	}, base)
 	if err != nil {
 		return nil, fmt.Errorf("controller defaults: %w", err)
@@ -173,10 +180,11 @@ func Load(getenv func(string) string) (*Config, error) {
 
 // Keys recognized in a GatewayClass parameters ConfigMap.
 const (
-	ParamTags             = "tags"
-	ParamReplicas         = "replicas"
-	ParamImage            = "image"
-	ParamDrainGracePeriod = "drainGracePeriod"
+	ParamTags               = "tags"
+	ParamReplicas           = "replicas"
+	ParamImage              = "image"
+	ParamDrainGracePeriod   = "drainGracePeriod"
+	ParamCertificateSharing = "certificateSharing"
 )
 
 // ParseClassParams overlays data on defaults. Empty values fall back to
@@ -224,6 +232,15 @@ func ParseClassParams(data map[string]string, defaults ClassParams) (ClassParams
 				return p, nil, fmt.Errorf("%s: %q is not a valid non-negative duration", ParamDrainGracePeriod, v)
 			}
 			p.DrainGracePeriod = d
+		case ParamCertificateSharing:
+			if v == "" {
+				continue
+			}
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return p, nil, fmt.Errorf("%s: %q is not a boolean", ParamCertificateSharing, v)
+			}
+			p.CertificateSharing = b
 		default:
 			unknown = append(unknown, k)
 		}
