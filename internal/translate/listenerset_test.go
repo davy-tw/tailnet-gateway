@@ -471,7 +471,7 @@ func TestListenerSetHostlessRoute(t *testing.T) {
 }
 
 // Services the Gateway's routes use on a listener without a hostname
-// belong to the Gateway too, and a later ListenerSet cannot take them,
+// belong to the Gateway too, and a newer ListenerSet cannot take them,
 // neither with a listener hostname nor with route hostnames.
 func TestListenerSetCannotTakeServiceOfGatewayRoute(t *testing.T) {
 	gw := allowListeners(gateway(listener("http", gwv1.HTTPProtocolType, 80)), gwv1.NamespacesFromAll, nil)
@@ -479,8 +479,8 @@ func TestListenerSetCannotTakeServiceOfGatewayRoute(t *testing.T) {
 	res := Translate(&Input{
 		Gateway: gw, TailnetDomain: domain,
 		ListenerSets: []*gwv1.ListenerSet{
-			listenerSet("team", "named", 1, entry("x", gwv1.HTTPProtocolType, 8080, "shop")),
-			listenerSet("team", "open", 2, entry("y", gwv1.HTTPProtocolType, 8081, "")),
+			listenerSet("team", "named", 20, entry("x", gwv1.HTTPProtocolType, 8080, "shop")),
+			listenerSet("team", "open", 21, entry("y", gwv1.HTTPProtocolType, 8081, "")),
 		},
 		HTTPRoutes: []*gwv1.HTTPRoute{infra, tenantRoute("evil", 1, []string{"shop"}, "open", "")},
 	})
@@ -524,7 +524,9 @@ func TestListenerSetBlockedByConflictedGatewayListener(t *testing.T) {
 }
 
 // A route with parentRefs to the Gateway and to a ListenerSet keeps its
-// parent results in parentRef order.
+// parent results in parentRef order. Through the ListenerSet it cannot add
+// a port to the Service it uses through the Gateway: that Service is the
+// Gateway's.
 func TestListenerSetDualParentOrder(t *testing.T) {
 	gw := allowListeners(gateway(listener("http", gwv1.HTTPProtocolType, 80)), gwv1.NamespacesFromSame, nil)
 	r := httpRoute("infra", "dual", 1, []string{"dual"}, rule(backendRef("web", 80)))
@@ -538,10 +540,55 @@ func TestListenerSetDualParentOrder(t *testing.T) {
 	if len(parents) != 2 || parents[0].ParentRef.Kind == nil || *parents[0].ParentRef.Kind != KindListenerSet || parents[1].ParentRef.Kind != nil {
 		t.Fatalf("parents = %+v", parents)
 	}
-	for _, p := range parents {
-		expectCond(t, p.Conditions, "Accepted", metav1.ConditionTrue, "Accepted")
+	expectCond(t, parents[0].Conditions, "Accepted", metav1.ConditionFalse, ReasonConflicted)
+	expectCond(t, parents[1].Conditions, "Accepted", metav1.ConditionTrue, "Accepted")
+	if svc := res.Config.Services["svc:dual"]; len(svc.TCP) != 1 || svc.TCP[80] == nil {
+		t.Errorf("config = %s", mustJSON(t, res.Config))
 	}
-	if svc := res.Config.Services["svc:dual"]; len(svc.TCP) != 2 {
+}
+
+// A tenant route that is Conflicted on the Gateway's listener cannot reach
+// the Gateway's Service through its own ListenerSet either.
+func TestListenerSetConflictedRouteCannotAddPort(t *testing.T) {
+	gw, infra := tenantGateway()
+	gw.Spec.Listeners[0].AllowedRoutes = &gwv1.AllowedRoutes{Namespaces: &gwv1.RouteNamespaces{From: ptr.To(gwv1.NamespacesFromAll)}}
+	evil := httpRoute("team", "evil", 20, []string{"admin"}, rule(backendRef("evil", 80)))
+	evil.Spec.ParentRefs = []gwv1.ParentReference{parent("gw"), setParent("team", "evil", "")}
+	res := Translate(&Input{
+		Gateway: gw, TailnetDomain: domain,
+		ListenerSets: []*gwv1.ListenerSet{listenerSet("team", "evil", 1, entry("any", gwv1.HTTPProtocolType, 8080, ""))},
+		HTTPRoutes:   []*gwv1.HTTPRoute{infra, evil},
+	})
+	for _, rr := range res.Routes {
+		if rr.Ref.Name != "evil" {
+			continue
+		}
+		for _, p := range rr.Parents {
+			expectCond(t, p.Conditions, "Accepted", metav1.ConditionFalse, ReasonConflicted)
+		}
+	}
+	if svc := res.Config.Services["svc:admin"]; len(svc.TCP) != 1 || svc.TCP[80] == nil {
+		t.Errorf("config = %s", mustJSON(t, res.Config))
+	}
+}
+
+// A route on a Gateway listener without a hostname cannot take a Service
+// that an older ListenerSet listener names; the older route keeps it the
+// other way round (TestListenerSetCannotTakeServiceOfGatewayRoute).
+func TestListenerSetHostnameOlderThanGatewayRoute(t *testing.T) {
+	gw := allowListeners(gateway(allNamespaces(listener("http", gwv1.HTTPProtocolType, 80))), gwv1.NamespacesFromAll, nil)
+	billing := tenantRoute("billing", 5, nil, "billing", "")
+	newcomer := httpRoute("other", "newcomer", 30, []string{"billing"}, rule(backendRef("evil", 80)))
+	res := Translate(&Input{
+		Gateway: gw, TailnetDomain: domain,
+		ListenerSets: []*gwv1.ListenerSet{listenerSet("team", "billing", 10, entry("b", gwv1.HTTPProtocolType, 8080, "billing"))},
+		HTTPRoutes:   []*gwv1.HTTPRoute{billing, newcomer},
+	})
+	expectCond(t, setListener(t, setResult(t, res, "team", "billing"), "b").Conditions, "Accepted", metav1.ConditionTrue, "Accepted")
+	expectCond(t, routeConds(t, res, KindHTTPRoute, "billing"), "Accepted", metav1.ConditionTrue, "Accepted")
+	expectCond(t, routeConds(t, res, KindHTTPRoute, "newcomer"), "Accepted", metav1.ConditionFalse, ReasonConflicted)
+	h := res.Config.Services["svc:billing"].Web["billing."+domain+":8080"].Handlers
+	if h["/"].Proxy != "http://evil.team.svc.cluster.local:80/" || res.Config.Services["svc:billing"].TCP[80] != nil {
 		t.Errorf("config = %s", mustJSON(t, res.Config))
 	}
 }

@@ -101,7 +101,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			// or a GitOps tool recreating it). Stop serving but keep the
 			// devices and state, as for an invalid class.
 			return ctrl.Result{}, errors.Join(r.withdraw(ctx, gw), r.writeClassMissingStatus(ctx, gw),
-				r.releaseListenerSets(ctx, gw, fmt.Sprintf("GatewayClass %q of the parent Gateway not found", gw.Spec.GatewayClassName)))
+				r.notAcceptListenerSets(ctx, gw, fmt.Sprintf("GatewayClass %q of the parent Gateway not found", gw.Spec.GatewayClassName)))
 		}
 		// The Gateway is being deleted, or now belongs to another
 		// controller's class.
@@ -109,10 +109,8 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err != nil || !done {
 			return ctrl.Result{RequeueAfter: pendingRequeue}, err
 		}
-		if deleting {
-			if err := r.releaseListenerSets(ctx, gw, "the parent Gateway is being deleted"); err != nil {
-				return ctrl.Result{}, err
-			}
+		if err := r.releaseListenerSets(ctx, gw, deleting); err != nil {
+			return ctrl.Result{}, err
 		}
 		orig := gw.DeepCopy()
 		controllerutil.RemoveFinalizer(gw, config.Finalizer)
@@ -1544,10 +1542,34 @@ func (r *GatewayReconciler) writeListenerSetStatus(ctx context.Context, gw *gwv1
 // Gateway API documents for a parent Gateway that is not programmed.
 const reasonParentNotProgrammed = "ParentNotProgrammed"
 
-// releaseListenerSets marks the ListenerSets that name gw as not accepted
-// when gw stops serving them for good (deletion) or for now (its class is
+// releaseListenerSets hands back the ListenerSets that name gw once this
+// controller stops serving gw: on deletion they get ParentNotAccepted; when
+// gw moved to another controller's class, they go back to the "waiting for
+// controller" conditions the CRD starts with, for that controller to
+// replace.
+func (r *GatewayReconciler) releaseListenerSets(ctx context.Context, gw *gwv1.Gateway, deleting bool) error {
+	if !r.Features.ListenerSet {
+		return nil
+	}
+	if deleting {
+		return r.notAcceptListenerSets(ctx, gw, "the parent Gateway is being deleted")
+	}
+	sets, err := r.listListenerSets(ctx)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, ls := range sets.of(gw) {
+		errs = append(errs, r.releaseListenerSet(ctx, ls, metav1.ConditionUnknown, string(gwv1.ListenerSetReasonPending),
+			string(gwv1.ListenerSetReasonPending), "Waiting for controller"))
+	}
+	return errors.Join(errs...)
+}
+
+// notAcceptListenerSets marks the ListenerSets that name gw as not
+// accepted while gw cannot serve them (it is deleted, or its class is
 // gone).
-func (r *GatewayReconciler) releaseListenerSets(ctx context.Context, gw *gwv1.Gateway, why string) error {
+func (r *GatewayReconciler) notAcceptListenerSets(ctx context.Context, gw *gwv1.Gateway, why string) error {
 	sets, err := r.listListenerSets(ctx)
 	if err != nil {
 		return err

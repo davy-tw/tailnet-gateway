@@ -290,4 +290,21 @@ func TestEnvtestListenerSetSelectorAndMove(t *testing.T) {
 		}
 		return nil
 	})
+
+	// The Gateway moves to another controller's class: its ListenerSets go
+	// back to waiting for a controller.
+	stay := &gwv1.ListenerSet{ObjectMeta: metav1.ObjectMeta{Namespace: "team", Name: "stay"}, Spec: ls.Spec}
+	e.create(stay, &gwv1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "other"},
+		Spec: gwv1.GatewayClassSpec{ControllerName: "example.com/other-controller"}})
+	e.eventually("stay accepted", e.listenerSetCond("team", "stay", "Accepted", metav1.ConditionTrue, ""))
+	g := &gwv1.Gateway{}
+	if err := e.get("infra", "shared", g); err != nil {
+		t.Fatal(err)
+	}
+	origGW := g.DeepCopy()
+	g.Spec.GatewayClassName = "other"
+	if err := e.c.Patch(e.ctx, g, client.MergeFrom(origGW)); err != nil {
+		t.Fatal(err)
+	}
+	e.eventually("handed back", e.listenerSetCond("team", "stay", "Accepted", metav1.ConditionUnknown, "Pending"))
 }

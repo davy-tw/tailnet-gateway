@@ -168,7 +168,7 @@ func Translate(in *Input) *Result {
 		sets:     map[types.NamespacedName]*setState{},
 
 		labelOwner:    map[string]int{},
-		labelRoutes:   map[string]map[RouteRef]bool{},
+		declared:      map[string]declaration{},
 		parentResults: map[RouteRef]map[int]ParentResult{},
 	}
 	return t.run()
@@ -190,8 +190,9 @@ type translator struct {
 	// ListenerSets in precedence order. A label is shared on every port,
 	// so one owner holds it on all of them.
 	labelOwner map[string]int
-	// labelRoutes records the routes placed on each label.
-	labelRoutes map[string]map[RouteRef]bool
+	// declared maps a label to the first allowed ListenerSet listener
+	// whose hostname names it.
+	declared map[string]declaration
 	// earlier holds the accepted listeners that later ListenerSet
 	// listeners must not conflict with.
 	earlier []*listenerState
@@ -223,6 +224,15 @@ func (ls *listenerState) rank() int {
 		return 0
 	}
 	return ls.set.rank
+}
+
+// declaration is a ListenerSet listener hostname, which claims its label
+// against newer routes of other owners.
+type declaration struct {
+	rank     int
+	listener gwv1.SectionName
+	set      *gwv1.ListenerSet
+	created  metav1.Time
 }
 
 type setState struct {
@@ -627,9 +637,17 @@ func (t *translator) prepareListenerSets() {
 		key := types.NamespacedName{Namespace: ls.Namespace, Name: ls.Name}
 		t.sets[key] = ss
 		t.setOrder = append(t.setOrder, ss)
-		if ss.allowed {
-			rank++
-			ss.rank = rank
+		if !ss.allowed {
+			continue
+		}
+		rank++
+		ss.rank = rank
+		for _, e := range ls.Spec.Listeners {
+			label := t.listenerLabel(e.Hostname)
+			if _, taken := t.declared[label]; label == "" || taken || compatibleKinds(e.Protocol) == nil {
+				continue
+			}
+			t.declared[label] = declaration{rank: rank, listener: e.Name, set: ls, created: ls.CreationTimestamp}
 		}
 	}
 }
@@ -1494,7 +1512,7 @@ func (rc *routeCtx) finishHTTPLike(hostnames []gwv1.Hostname, mounts []httpMount
 			}
 			for _, label := range dedupe(labels) {
 				for _, m := range mounts {
-					if c := t.addMount(label, rc.rank, uint16(a.ls.l.Port), mode, m, rc.item.ref); c != "" {
+					if c := t.addMount(label, rc.rank, rc.item.created, uint16(a.ls.l.Port), mode, m, rc.item.ref); c != "" {
 						conflicts = append(conflicts, c)
 					} else {
 						placed++
@@ -1541,27 +1559,33 @@ func (t *translator) claimed(label string) string {
 //
 // A route that already uses label through one parent may use it through
 // another: it adds nothing that is not its own.
-func (t *translator) ownLabel(label string, rank int, route RouteRef) string {
-	owner, ok := t.labelOwner[label]
-	if ok && owner != rank && !t.labelRoutes[label][route] {
-		return fmt.Sprintf("svc:%s belongs to %s", label, t.ownerName(owner))
+//
+// A label that no owner holds yet, but that a ListenerSet listener of
+// another owner names in its hostname, goes to the older of the two: the
+// route (created) or the ListenerSet. A listener hostname is more specific
+// than a route on a listener without one, and whichever was there first
+// keeps serving when the other one is added.
+func (t *translator) ownLabel(label string, rank int, created metav1.Time) string {
+	if owner, ok := t.labelOwner[label]; ok {
+		if owner != rank {
+			return fmt.Sprintf("svc:%s belongs to %s", label, t.ownerName(owner))
+		}
+		return ""
 	}
-	if !ok {
-		t.labelOwner[label] = rank
+	if d, ok := t.declared[label]; ok && d.rank != rank && !created.Before(&d.created) {
+		return fmt.Sprintf("svc:%s is named by listener %q of ListenerSet %s/%s, which is older than this route",
+			label, d.listener, d.set.Namespace, d.set.Name)
 	}
-	if t.labelRoutes[label] == nil {
-		t.labelRoutes[label] = map[RouteRef]bool{}
-	}
-	t.labelRoutes[label][route] = true
+	t.labelOwner[label] = rank
 	return ""
 }
 
 // addMount places an HTTP mount; it returns a conflict message or "".
-func (t *translator) addMount(label string, rank int, port uint16, mode string, m httpMount, owner RouteRef) string {
+func (t *translator) addMount(label string, rank int, created metav1.Time, port uint16, mode string, m httpMount, owner RouteRef) string {
 	if c := t.claimed(label); c != "" {
 		return c
 	}
-	if c := t.ownLabel(label, rank, owner); c != "" {
+	if c := t.ownLabel(label, rank, created); c != "" {
 		return c
 	}
 	s := t.svc(label)
@@ -1690,7 +1714,7 @@ func (rc *routeCtx) finishStream(hostnames []gwv1.Hostname, useHostnames bool, d
 				mode = "tls"
 			}
 			for _, l := range dedupe(valid) {
-				if c := t.addStream(l, rc.rank, uint16(a.ls.l.Port), mode, hostPort(b), rc.item.ref); c != "" {
+				if c := t.addStream(l, rc.rank, rc.item.created, uint16(a.ls.l.Port), mode, hostPort(b), rc.item.ref); c != "" {
 					conflicts = append(conflicts, c)
 				} else {
 					placed++
@@ -1710,11 +1734,11 @@ func (rc *routeCtx) finishStream(hostnames []gwv1.Hostname, useHostnames bool, d
 
 func hostPort(b *backend) string { return b.host + ":" + strconv.Itoa(int(b.port)) }
 
-func (t *translator) addStream(label string, rank int, port uint16, mode, target string, owner RouteRef) string {
+func (t *translator) addStream(label string, rank int, created metav1.Time, port uint16, mode, target string, owner RouteRef) string {
 	if c := t.claimed(label); c != "" {
 		return c
 	}
-	if c := t.ownLabel(label, rank, owner); c != "" {
+	if c := t.ownLabel(label, rank, created); c != "" {
 		return c
 	}
 	s := t.svc(label)
