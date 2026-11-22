@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -279,6 +280,7 @@ func TestEnvtestCertificateSeeding(t *testing.T) {
 		}
 		s.Data[domain+".crt"] = c
 		s.Data[domain+".key"] = []byte(fmt.Sprintf("key%d", i))
+		s.Data["acme-account.key.pem"] = []byte(fmt.Sprintf("account%d", i))
 		if err := e.c.Update(e.ctx, s); err != nil {
 			t.Fatal(err)
 		}
@@ -293,6 +295,14 @@ func TestEnvtestCertificateSeeding(t *testing.T) {
 	}
 	if string(sec.Data["tls.crt"]) != string(certs[1]) || string(sec.Data["tls.key"]) != "key1" {
 		t.Errorf("shared Secret not seeded from the longest valid certificate: %v", keys(sec.Data))
+	}
+	// Stamped with the issuing account, so that replica 0 does not claim
+	// to replace another account's certificate when it renews.
+	if fp := sha256.Sum256([]byte("account1")); string(sec.Data["acme-account-fingerprint"]) != string(fp[:]) {
+		t.Errorf("acme-account-fingerprint = %x, want %x", sec.Data["acme-account-fingerprint"], fp)
+	}
+	if s := (&corev1.Secret{}); e.get("s", proxy.StateSecretName("gw", 1), s) == nil && len(s.Data["acme-account.key.pem"]) == 0 {
+		t.Error("the ACME account key was stripped from a state Secret")
 	}
 	for i := range certs {
 		s := &corev1.Secret{}

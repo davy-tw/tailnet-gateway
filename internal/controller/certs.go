@@ -29,6 +29,13 @@ import (
 const (
 	certSecretKeyCert = "tls.crt"
 	certSecretKeyKey  = "tls.key"
+	// certSecretKeyACMEFingerprint is the raw SHA-256 of the PEM ACME
+	// account key that issued the certificate (kubestore's
+	// acmeAccountKeyFingerprint).
+	certSecretKeyACMEFingerprint = "acme-account-fingerprint"
+	// stateKeyACMEAccount is where tailscaled keeps its ACME account key
+	// in a state Secret.
+	stateKeyACMEAccount = "acme-account.key.pem"
 )
 
 // Bookkeeping annotations on certificate Secrets that only the controller
@@ -378,7 +385,7 @@ func (r *GatewayReconciler) seedCertSecrets(ctx context.Context, gw *gwv1.Gatewa
 		for i := range states {
 			st := &states[i]
 			cert, key := st.Data[d+".crt"], st.Data[d+".key"]
-			if len(key) == 0 || !certValidFor(cert, d, now) {
+			if len(key) == 0 || len(st.Data[stateKeyACMEAccount]) == 0 || !certValidFor(cert, d, now) {
 				continue
 			}
 			if after := certNotAfter(cert); best == nil || after.After(bestAfter) {
@@ -388,8 +395,18 @@ func (r *GatewayReconciler) seedCertSecrets(ctx context.Context, gw *gwv1.Gatewa
 		if best == nil {
 			continue
 		}
+		// Stamp the ACME account that issued it: replica 0 renews with
+		// ARI's "replaces" only when the stamp matches its own account,
+		// and Let's Encrypt refuses "replaces" for another account's
+		// certificate (tailscale/tailscale#18251), which would fail every
+		// renewal until it expires.
+		fp := sha256.Sum256(best.Data[stateKeyACMEAccount])
 		orig := sec.DeepCopy()
-		sec.Data = map[string][]byte{certSecretKeyCert: best.Data[d+".crt"], certSecretKeyKey: best.Data[d+".key"]}
+		sec.Data = map[string][]byte{
+			certSecretKeyCert:            best.Data[d+".crt"],
+			certSecretKeyKey:             best.Data[d+".key"],
+			certSecretKeyACMEFingerprint: fp[:],
+		}
 		if err := r.Patch(ctx, sec, client.MergeFrom(orig)); err != nil {
 			return fmt.Errorf("seeding certificate Secret %s: %w", d, err)
 		}
