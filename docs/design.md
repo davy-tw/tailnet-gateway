@@ -127,13 +127,15 @@ versions.
 | UDPRoute | Optional, recognized only to report it as unsupported |
 | ReferenceGrant | Authorizes cross-namespace backend references |
 | BackendTLSPolicy | Upgrades the proxy-to-backend hop to TLS |
+| ListenerSet | Optional: adds listeners to a Gateway (see [ListenerSets](#listenersets)) |
 | Ingress (`networking.k8s.io/v1`), Service (`v1`) | Translated into Gateways and routes |
 
 At startup the controller checks which of these are served. If a required
 kind is missing, it logs that Gateway API v1.6.0 or newer is needed and keeps
 retrying instead of crash-looping. A missing optional kind disables that
 feature with one log line, and listeners report the kind as unsupported; it
-never fails a Gateway. ListenerSet is out of scope for the first version.
+never fails a Gateway. Without the ListenerSet CRD, ListenerSets are simply
+not watched.
 
 Gateways are selected by resolving their GatewayClass and comparing its
 `controllerName`, and every served class gets an `Accepted` condition.
@@ -247,7 +249,8 @@ Each Gateway's Role allows get, update and patch only on its own state
 Secrets (`resourceNames` `N-0` to `N-<replicas-1>`), plus the event access
 the image needs. No proxy gets cluster-wide Secret access.
 
-The controller's ClusterRole covers the Gateway API kinds and their status,
+The controller's ClusterRole covers the Gateway API kinds (ListenerSets
+included) and their status,
 Ingresses and their status, Services and their status, Secrets, ConfigMaps,
 ServiceAccounts, Roles, RoleBindings, StatefulSets, PodDisruptionBudgets,
 Leases and Events.
@@ -271,10 +274,80 @@ created.
   hostname intersection are all evaluated.
 - Each route gets a `RouteStatus.parents[]` entry with `Accepted` and
   `ResolvedRefs`, and each listener reports `attachedRoutes`.
-- The controller watches routes, ReferenceGrants, BackendTLSPolicies,
+- The controller watches routes, ListenerSets, ReferenceGrants, BackendTLSPolicies,
   Services, Namespaces and the owned objects, and enqueues the affected
   Gateways. Its cache holds only the Secrets it labels as its own (the
   state Secrets), never the rest of the cluster's Secrets.
+
+## ListenerSets
+
+A ListenerSet adds listeners to the Gateway its `parentRef` names, so that
+for example a team can expose its own Tailscale Service names on a shared
+Gateway without editing it. Its listeners are served by that Gateway's
+proxy: there is no data plane per ListenerSet.
+
+- A Gateway allows no ListenerSet unless its `spec.allowedListeners`
+  says so: `from: Same` (the Gateway's namespace), `All`, or `Selector`
+  (namespace labels). Others get `Accepted=False` and `Programmed=False`
+  with reason `NotAllowed`, and their listeners are not used.
+- Listeners are merged in the Gateway API precedence order: the Gateway's
+  own, then ListenerSets oldest first, then by namespace/name. A ListenerSet
+  listener that conflicts with an earlier one gets `Accepted=False`,
+  `Conflicted=True` and `Programmed=False` with reason `ProtocolConflict`
+  (another protocol family on the same port) or `HostnameConflict` (the
+  same port and the same hostname, compared by the Tailscale Service it
+  names, so `admin` and `admin.<tailnet>.ts.net` are the same), and the
+  earlier listener keeps serving. Conflicts among the Gateway's own
+  listeners still leave all of them out, but their ports stay reserved for
+  the Gateway.
+- A Tailscale Service name is shared on every port, so it belongs to one
+  owner of the Gateway: the Gateway or one ListenerSet. Owners are settled
+  in precedence order. The Gateway holds its default Service (its name),
+  its listener hostnames, and the names its routes use; then each
+  ListenerSet in turn holds its listener hostnames and the names its routes
+  use, if no earlier owner holds them. A ListenerSet listener whose
+  hostname names an earlier owner's Service gets `HostnameConflict`, on any
+  port and protocol, and a route that would add to another owner's Service
+  gets `Accepted=False` with reason `Conflicted`, whatever the route's age
+  and through whichever parentRef. This keeps one namespace that a Gateway
+  allows from taking or extending a Service of the Gateway's owner or of
+  another namespace.
+- One exception keeps routes on listeners without a hostname from taking
+  what a ListenerSet declared: a name that a ListenerSet listener hostname
+  names, and that is not a Gateway listener hostname or the Gateway's own
+  name, goes to the older of the two. A route (on the Gateway or an earlier
+  ListenerSet) created before the ListenerSet keeps it, and the listener
+  gets `HostnameConflict`; a route created after the ListenerSet gets
+  `Conflicted`. Adding either one never takes a Service from the other.
+- A ListenerSet is `Accepted=True` when at least one of its listeners is
+  valid (reason `ListenersNotValid` when some are not), and
+  `Accepted=False` with `ListenersNotValid` when none is, or with
+  `ParentNotAccepted` when the Gateway is not accepted.
+  `Programmed` follows the Gateway's (`ParentNotProgrammed` until then).
+  The Gateway's `status.attachedListenerSets` counts the accepted ones;
+  its `status.listeners` lists only its own listeners, and each
+  ListenerSet lists its own in `status.listeners`.
+- Routes attach to ListenerSet listeners only through a parentRef of kind
+  `ListenerSet` (optionally with `sectionName` or `port`), and to the
+  Gateway's own listeners only through a parentRef to the Gateway. The
+  route's status entry names the parent it used. `allowedRoutes` with
+  `from: Same` on a ListenerSet listener means the ListenerSet's namespace.
+- A route without hostnames on a ListenerSet listener without a hostname
+  has no Tailscale Service name: it gets `Accepted=False` with reason
+  `UnsupportedValue` instead of falling back to the Gateway's default
+  Service. Either side must set a hostname.
+- When the Gateway is deleted, or its GatewayClass disappears, its
+  ListenerSets get `Accepted=False` with reason `ParentNotAccepted`. The
+  Gateway records the ListenerSets it wrote status for in its
+  `tailnet-gateway.davy.tw/listener-sets` annotation, so that one whose
+  `parentRef` moves to a Gateway that does not exist also gets
+  `ParentNotAccepted`, and one that moves to another controller's Gateway
+  goes back to `Unknown`/`Pending`, unless its status was already written
+  for its new generation. When the Gateway itself moves to another
+  controller's class, its ListenerSets go back to `Unknown`/`Pending` once
+  its cleanup is done, for that controller to take over.
+- Listener `certificateRefs` are ignored on ListenerSets too, so no
+  ReferenceGrant is checked for them.
 
 ## Translation to the serve config
 

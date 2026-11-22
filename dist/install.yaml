@@ -56,6 +56,7 @@ rules:
   - udproutes
   - referencegrants
   - backendtlspolicies
+  - listenersets
   verbs:
   - get
   - list
@@ -75,6 +76,7 @@ rules:
   - tcproutes/status
   - udproutes/status
   - backendtlspolicies/status
+  - listenersets/status
   verbs:
   - get
   - update

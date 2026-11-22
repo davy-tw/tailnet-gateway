@@ -1,0 +1,99 @@
+# A shared Gateway that lets ListenerSets in its own namespace add
+# listeners, and a ListenerSet that adds three listeners, all served by the
+# Gateway's proxy. Routes attach to the ListenerSet, not the Gateway:
+#   - web (HTTP 8080):     svc:team-web on port 8080
+#   - secure (HTTPS 443):  svc:team-secure on 443, TLS terminated by
+#                          Tailscale with the tailnet's certificate
+#   - passthrough (TLS 8443): svc:team-tls on 8443, TLS forwarded as is to
+#                          a backend that serves its own certificate
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: shared
+  namespace: tailnet-demo
+spec:
+  gatewayClassName: tailnet
+  allowedListeners:
+    namespaces:
+      from: Same
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata:
+  name: team
+  namespace: tailnet-demo
+spec:
+  parentRef:
+    name: shared
+  listeners:
+    - name: web
+      protocol: HTTP
+      port: 8080
+    # The certificate comes from Tailscale; the options entry only
+    # satisfies the Gateway API rule that a terminating listener names one.
+    - name: secure
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        options:
+          tailnet-gateway.davy.tw/certificates: tailscale
+    - name: passthrough
+      protocol: TLS
+      port: 8443
+      tls:
+        mode: Passthrough
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: team-web
+  namespace: tailnet-demo
+spec:
+  parentRefs:
+    - kind: ListenerSet
+      name: team
+      sectionName: web
+  hostnames: ["team-web"]
+  rules:
+    - backendRefs:
+        - name: web
+          port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: team-secure
+  namespace: tailnet-demo
+spec:
+  parentRefs:
+    - kind: ListenerSet
+      name: team
+      sectionName: secure
+  hostnames: ["team-secure"]
+  rules:
+    - backendRefs:
+        - name: web
+          port: 80
+---
+# Passthrough: each hostname becomes its own Tailscale Service with a raw
+# TCP forward, so the backend terminates TLS for team-tls.<tailnet>.ts.net.
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: team-tls
+  namespace: tailnet-demo
+spec:
+  parentRefs:
+    - kind: ListenerSet
+      name: team
+      sectionName: passthrough
+  hostnames: ["team-tls"]
+  rules:
+    - backendRefs:
+        - name: web
+          port: 443

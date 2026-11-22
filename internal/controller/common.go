@@ -55,6 +55,7 @@ type Features struct {
 	UDPRoute         bool
 	ReferenceGrant   bool
 	BackendTLSPolicy bool
+	ListenerSet      bool
 }
 
 // SupportedRouteKinds is the translate.Input.Supported map.
@@ -70,7 +71,7 @@ func (f Features) SupportedRouteKinds() map[string]bool {
 
 // AllFeatures enables every optional kind (for tests).
 func AllFeatures() Features {
-	return Features{GRPCRoute: true, TLSRoute: true, TCPRoute: true, UDPRoute: true, ReferenceGrant: true, BackendTLSPolicy: true}
+	return Features{GRPCRoute: true, TLSRoute: true, TCPRoute: true, UDPRoute: true, ReferenceGrant: true, BackendTLSPolicy: true, ListenerSet: true}
 }
 
 // ErrMissingCoreCRDs is returned by DetectFeatures when GatewayClass,
@@ -109,6 +110,7 @@ func DetectFeatures(dc discovery.DiscoveryInterface) (Features, error) {
 		UDPRoute:         kinds["UDPRoute"],
 		ReferenceGrant:   kinds["ReferenceGrant"],
 		BackendTLSPolicy: kinds["BackendTLSPolicy"],
+		ListenerSet:      kinds["ListenerSet"],
 	}, nil
 }
 
@@ -178,6 +180,32 @@ func gatewayParentRef(gw *gwv1.Gateway) gwv1.ParentReference {
 	k := gwv1.Kind(translate.KindGateway)
 	ns := gwv1.Namespace(gw.Namespace)
 	return gwv1.ParentReference{Group: &g, Kind: &k, Namespace: &ns, Name: gwv1.ObjectName(gw.Name)}
+}
+
+// listenerSetParentRef returns the ListenerSet a parentRef (from an object
+// in routeNS) names, if it names one.
+func listenerSetParentRef(p gwv1.ParentReference, routeNS string) (types.NamespacedName, bool) {
+	if p.Group != nil && string(*p.Group) != gwv1.GroupName || p.Kind == nil || string(*p.Kind) != translate.KindListenerSet {
+		return types.NamespacedName{}, false
+	}
+	ns := routeNS
+	if p.Namespace != nil {
+		ns = string(*p.Namespace)
+	}
+	return types.NamespacedName{Namespace: ns, Name: string(p.Name)}, true
+}
+
+// listenerSetGateway returns the Gateway a ListenerSet's parentRef names.
+func listenerSetGateway(ls *gwv1.ListenerSet) (types.NamespacedName, bool) {
+	p := ls.Spec.ParentRef
+	if p.Group != nil && string(*p.Group) != gwv1.GroupName || p.Kind != nil && string(*p.Kind) != translate.KindGateway {
+		return types.NamespacedName{}, false
+	}
+	ns := ls.Namespace
+	if p.Namespace != nil && *p.Namespace != "" {
+		ns = string(*p.Namespace)
+	}
+	return types.NamespacedName{Namespace: ns, Name: string(p.Name)}, true
 }
 
 // parentRefTargets reports whether p (from an object in routeNS) points at
