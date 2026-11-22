@@ -69,7 +69,7 @@ func TestEnvtestCertificateSharing(t *testing.T) {
 	writeCert := func(notAfter time.Time) {
 		t.Helper()
 		s := certSecret()
-		s.Data = map[string][]byte{"tls.crt": testCert(t, domain, notAfter), "tls.key": []byte("key")}
+		s.Data = map[string][]byte{"tls.crt": testCert(t, domain, notAfter.Add(-90*24*time.Hour), notAfter), "tls.key": []byte("key")}
 		if err := e.c.Update(e.ctx, s); err != nil {
 			t.Fatal(err)
 		}
@@ -89,12 +89,13 @@ func TestEnvtestCertificateSharing(t *testing.T) {
 	}
 
 	pods := createProxyPods(e, "c", "gw", 2)
-	first := time.Now().Add(90 * 24 * time.Hour).Truncate(time.Second)
+	// A 90-day certificate with 30 days left, the usual point of renewal.
+	first := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
 	writeCert(first)
 	reconcile()
 	sec = certSecret()
 	if sec.Annotations[proxy.AnnotationCertificateNotAfter] != first.UTC().Format(time.RFC3339) ||
-		sec.Annotations[proxy.AnnotationPreviousCertificateNotAfter] != "" {
+		sec.Annotations[proxy.AnnotationRestartReadersBy] != "" {
 		t.Errorf("annotations after the first certificate = %v", sec.Annotations)
 	}
 
@@ -104,7 +105,7 @@ func TestEnvtestCertificateSharing(t *testing.T) {
 	writeCert(second)
 	reconcile()
 	sec = certSecret()
-	if sec.Annotations[proxy.AnnotationPreviousCertificateNotAfter] != first.UTC().Format(time.RFC3339) {
+	if sec.Annotations[proxy.AnnotationRestartReadersBy] != first.Add(-certRestartMargin).UTC().Format(time.RFC3339) {
 		t.Errorf("annotations after a renewal = %v", sec.Annotations)
 	}
 	states, _, err := r.syncCertSecrets(e.ctx, gatewayOf(e, "c", "gw"), certSpec(r, e, "c", "gw", cfg.Defaults, domain), time.Now())
@@ -129,11 +130,18 @@ func TestEnvtestCertificateSharing(t *testing.T) {
 	assertDeleting(e, "c", map[string]bool{"gw-0": false, "gw-1": false})
 
 	// Once it is about to expire, the reading replica is restarted, and
-	// never replica 0.
-	if _, err := r.restartStaleReaders(e.ctx, gatewayOf(e, "c", "gw"), cfg.Defaults, states, first.Add(-certRestartMargin+time.Hour)); err != nil {
+	// never replica 0, but only while all replicas are ready...
+	setReady(e, "c", "gw-0", false)
+	if again, err := r.restartStaleReaders(e.ctx, gatewayOf(e, "c", "gw"), cfg.Defaults, states, first.Add(-certRestartMargin+time.Hour)); err != nil || again == 0 {
+		t.Fatalf("again %v, %v", again, err)
+	}
+	assertDeleting(e, "c", map[string]bool{"gw-0": false, "gw-1": false})
+	// ...unless the certificate it holds would expire first.
+	if _, err := r.restartStaleReaders(e.ctx, gatewayOf(e, "c", "gw"), cfg.Defaults, states, first.Add(-12*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	assertDeleting(e, "c", map[string]bool{"gw-0": false, "gw-1": true})
+	setReady(e, "c", "gw-0", true)
 	_ = pods
 	createProxyPods(e, "c", "gw", 2) // the StatefulSet replaces it
 
@@ -151,6 +159,17 @@ func TestEnvtestCertificateSharing(t *testing.T) {
 	_ = e.get("c", "gw-1", state)
 	if _, ok := state.Data[domain+".crt"]; ok || string(state.Data["authkey"]) != "tskey-auth-user" {
 		t.Errorf("state Secret keys = %v", keys(state.Data))
+	}
+
+	// A Secret deleted behind the controller's back comes back marked for
+	// restarting the replicas that may hold its old certificate.
+	if err := e.c.Delete(e.ctx, certSecret()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond) // pods older than the deletion
+	reconcile()
+	if sec = certSecret(); sec.Annotations[proxy.AnnotationRestartReadersBy] == "" {
+		t.Errorf("recreated Secret annotations = %v", sec.Annotations)
 	}
 
 	// A name no longer served stays granted for a while, as replica 0 may
@@ -250,8 +269,8 @@ func TestEnvtestCertificateSeeding(t *testing.T) {
 		t.Fatal(err)
 	}
 	certs := map[int][]byte{
-		0: testCert(t, domain, time.Now().Add(80*24*time.Hour)),
-		1: testCert(t, domain, time.Now().Add(85*24*time.Hour)),
+		0: testCert(t, domain, time.Now().Add(-10*24*time.Hour), time.Now().Add(80*24*time.Hour)),
+		1: testCert(t, domain, time.Now().Add(-5*24*time.Hour), time.Now().Add(85*24*time.Hour)),
 	}
 	for i, c := range certs {
 		s := &corev1.Secret{}
@@ -328,6 +347,23 @@ func rootRoute(ns, name, gateway, backend string) *gwv1.HTTPRoute {
 	}}
 }
 
+// setReady sets a pod's Ready condition.
+func setReady(e *env, ns, name string, ready bool) {
+	e.t.Helper()
+	p := &corev1.Pod{}
+	if err := e.get(ns, name, p); err != nil {
+		e.t.Fatal(err)
+	}
+	st := corev1.ConditionFalse
+	if ready {
+		st = corev1.ConditionTrue
+	}
+	p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: st}}
+	if err := e.c.Status().Update(e.ctx, p); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
 // replacePod replaces a proxy pod, in cert share mode or not.
 func replacePod(e *env, ns, gw string, ord int, shares bool) {
 	e.t.Helper()
@@ -396,14 +432,14 @@ func certSpec(r *GatewayReconciler, e *env, ns, gw string, params config.ClassPa
 }
 
 // testCert returns a self-signed PEM certificate for name.
-func testCert(t *testing.T, name string, notAfter time.Time) []byte {
+func testCert(t *testing.T, name string, notBefore, notAfter time.Time) []byte {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tmpl := &x509.Certificate{SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: name},
-		DNSNames: []string{name}, NotBefore: time.Now().Add(-time.Hour), NotAfter: notAfter}
+		DNSNames: []string{name}, NotBefore: notBefore, NotAfter: notAfter}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)

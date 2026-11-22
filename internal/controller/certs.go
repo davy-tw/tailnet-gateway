@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -38,8 +40,8 @@ const (
 	annotationCertificateObservedAt = config.Domain + "/certificate-observed-at"
 	// annotationUnusedSince is when the hostname stopped being served. The
 	// Secret is kept while reading replicas started before then exist:
-	// they may hold its certificate in memory, and would serve it again
-	// (even expired) if the hostname came back.
+	// they may hold its certificate in memory, and would use it again if
+	// the hostname came back (failing handshakes once it has expired).
 	annotationUnusedSince = config.Domain + "/unused-since"
 )
 
@@ -52,6 +54,12 @@ var timeNow = time.Now
 // Encrypt), so pods restarted for other reasons in between need nothing.
 const certRestartMargin = 7 * 24 * time.Hour
 
+// earlyRenewal is the share of its lifetime a certificate still had when
+// it was replaced above which the replacement is taken for early (for
+// example after a revocation): the replicas holding it are then restarted
+// at once. Tailscale normally renews with about a third left.
+const earlyRenewal = 0.45
+
 // listReloadWindow is how long after a renewal a reading replica that may
 // list Secrets can still hold the previous certificate: tailscaled reloads
 // certificates daily.
@@ -63,9 +71,9 @@ type certState struct {
 	name string
 	// observedAt is when the current certificate was first seen.
 	observedAt time.Time
-	// previousNotAfter is the expiry of the certificate before it, zero
-	// if none was seen.
-	previousNotAfter time.Time
+	// restartBy is when the reading replicas started before observedAt
+	// must be restarted; zero if none need to be.
+	restartBy time.Time
 }
 
 // certSecrets returns the certificate Secrets the Gateway controls.
@@ -141,10 +149,14 @@ func (r *GatewayReconciler) syncCertSecrets(ctx context.Context, gw *gwv1.Gatewa
 		return nil, 0, err
 	}
 	var pods map[int]*corev1.Pod
-	if len(existing) > 0 {
+	if len(existing) > 0 || spec.Params.CertificateSharing {
 		if pods, err = r.proxyPods(ctx, gw); err != nil {
 			return nil, 0, err
 		}
+	}
+	granted, err := r.grantedCertSecrets(ctx, gw)
+	if err != nil {
+		return nil, 0, err
 	}
 	byName := map[string]*corev1.Secret{}
 	for i := range existing {
@@ -183,20 +195,19 @@ func (r *GatewayReconciler) syncCertSecrets(ctx context.Context, gw *gwv1.Gatewa
 		}
 		ann := map[string]string{}
 		if cur != nil {
-			for _, k := range []string{proxy.AnnotationCertificateSHA256, proxy.AnnotationCertificateNotAfter,
-				proxy.AnnotationPreviousCertificateNotAfter, annotationCertificateObservedAt, annotationUnusedSince} {
+			for _, k := range []string{proxy.AnnotationCertificateSHA256, proxy.AnnotationCertificateNotBefore,
+				proxy.AnnotationCertificateNotAfter, proxy.AnnotationRestartReadersBy,
+				annotationCertificateObservedAt, annotationUnusedSince} {
 				if v := cur.Annotations[k]; v != "" {
 					ann[k] = v
 				}
 			}
-			if sum, notAfter, ok := certInfo(cur); ok && sum != ann[proxy.AnnotationCertificateSHA256] {
-				if ann[proxy.AnnotationCertificateSHA256] != "" {
-					ann[proxy.AnnotationPreviousCertificateNotAfter] = ann[proxy.AnnotationCertificateNotAfter]
-				}
-				ann[proxy.AnnotationCertificateSHA256] = sum
-				ann[proxy.AnnotationCertificateNotAfter] = notAfter.UTC().Format(time.RFC3339)
-				ann[annotationCertificateObservedAt] = stamp
-			}
+			trackCertificate(ann, cur, pods, now)
+		} else if want[name] && granted[name] && readerStartedBefore(pods, now) {
+			// The Secret was deleted behind the controller's back: the
+			// reading replicas may hold its certificate, whose expiry is
+			// lost, so they are restarted once the new one is there.
+			ann[proxy.AnnotationRestartReadersBy] = stamp
 		}
 		grant := true
 		switch {
@@ -230,9 +241,9 @@ func (r *GatewayReconciler) syncCertSecrets(ctx context.Context, gw *gwv1.Gatewa
 		}
 		if want[name] {
 			states = append(states, certState{
-				name:             name,
-				observedAt:       parseTime(ann[annotationCertificateObservedAt]),
-				previousNotAfter: parseTime(ann[proxy.AnnotationPreviousCertificateNotAfter]),
+				name:       name,
+				observedAt: parseTime(ann[annotationCertificateObservedAt]),
+				restartBy:  parseTime(ann[proxy.AnnotationRestartReadersBy]),
 			})
 		}
 	}
@@ -240,6 +251,64 @@ func (r *GatewayReconciler) syncCertSecrets(ctx context.Context, gw *gwv1.Gatewa
 		later(pendingRequeue)
 	}
 	return states, next, nil
+}
+
+// trackCertificate updates a certificate Secret's bookkeeping annotations
+// from the certificate it holds.
+//
+// Reading replicas started before the current certificate was observed
+// may hold an older one; AnnotationRestartReadersBy is the earliest time
+// one of those must be replaced. It is dropped once no such replica is
+// left, and only ever moves earlier while one is, so a second renewal
+// before they restart does not push it past an older certificate's expiry.
+func trackCertificate(ann map[string]string, cur *corev1.Secret, pods map[int]*corev1.Pod, now time.Time) {
+	observed := parseTime(ann[annotationCertificateObservedAt])
+	if !observed.IsZero() && !readerStartedBefore(pods, observed) {
+		delete(ann, proxy.AnnotationRestartReadersBy)
+	}
+	sum, notBefore, notAfter, ok := certInfo(cur)
+	if !ok || sum == ann[proxy.AnnotationCertificateSHA256] {
+		return
+	}
+	if ann[proxy.AnnotationCertificateSHA256] != "" {
+		oldBefore, oldAfter := parseTime(ann[proxy.AnnotationCertificateNotBefore]), parseTime(ann[proxy.AnnotationCertificateNotAfter])
+		by := oldAfter.Add(-certRestartMargin)
+		if life := oldAfter.Sub(oldBefore); !oldBefore.IsZero() && life > 0 &&
+			float64(oldAfter.Sub(now)) > earlyRenewal*float64(life) {
+			by = now
+		}
+		if prev := parseTime(ann[proxy.AnnotationRestartReadersBy]); !prev.IsZero() && prev.Before(by) {
+			by = prev
+		}
+		if !oldAfter.IsZero() {
+			ann[proxy.AnnotationRestartReadersBy] = by.UTC().Format(time.RFC3339)
+		}
+	}
+	ann[proxy.AnnotationCertificateSHA256] = sum
+	ann[proxy.AnnotationCertificateNotBefore] = notBefore.UTC().Format(time.RFC3339)
+	ann[proxy.AnnotationCertificateNotAfter] = notAfter.UTC().Format(time.RFC3339)
+	ann[annotationCertificateObservedAt] = now.UTC().Format(time.RFC3339)
+}
+
+// grantedCertSecrets returns the certificate Secrets the proxies' Role
+// grants now.
+func (r *GatewayReconciler) grantedCertSecrets(ctx context.Context, gw *gwv1.Gateway) (map[string]bool, error) {
+	role := &rbacv1.Role{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: gw.Namespace, Name: gw.Name}, role); err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	out := map[string]bool{}
+	if !metav1.IsControlledBy(role, gw) {
+		return out, nil
+	}
+	for _, rule := range role.Rules {
+		for _, n := range rule.ResourceNames {
+			if strings.HasSuffix(n, ".ts.net") {
+				out[n] = true
+			}
+		}
+	}
+	return out, nil
 }
 
 // certGrantGrace is how long a name that is no longer served stays granted:
@@ -333,9 +402,10 @@ func (r *GatewayReconciler) restartStaleReaders(ctx context.Context, gw *gwv1.Ga
 	list := params.CertificateReload == config.CertificateReloadList
 	var pods map[int]*corev1.Pod
 	var next time.Duration
+	var earliest time.Time
 	due := map[int]string{}
 	for _, st := range states {
-		if st.previousNotAfter.IsZero() || st.observedAt.IsZero() {
+		if st.restartBy.IsZero() || st.observedAt.IsZero() {
 			continue
 		}
 		if list && now.Sub(st.observedAt) > listReloadWindow {
@@ -350,7 +420,7 @@ func (r *GatewayReconciler) restartStaleReaders(ctx context.Context, gw *gwv1.Ga
 		if !readerStartedBefore(pods, st.observedAt) {
 			continue
 		}
-		deadline := st.previousNotAfter.Add(-certRestartMargin)
+		deadline := st.restartBy
 		if now.Before(deadline) {
 			if list {
 				// The daily reload will have replaced it by then.
@@ -366,18 +436,28 @@ func (r *GatewayReconciler) restartStaleReaders(ctx context.Context, gw *gwv1.Ga
 				due[ord] = st.name
 			}
 		}
+		if earliest.IsZero() || deadline.Before(earliest) {
+			earliest = deadline
+		}
 	}
 	if len(due) == 0 {
 		return next, nil
 	}
-	// One replica at a time, and only while all the others serve.
-	if int32(len(pods)) != params.Replicas {
-		return pendingRequeue, nil
-	}
 	for _, p := range pods {
-		if !p.DeletionTimestamp.IsZero() || !podReady(p) {
-			return pendingRequeue, nil
+		if !p.DeletionTimestamp.IsZero() {
+			return pendingRequeue, nil // one replica at a time
 		}
+	}
+	// Only while all the others serve, unless waiting would let the
+	// certificate they hold expire.
+	if int32(len(pods)) != params.Replicas || slices.ContainsFunc(slices.Collect(maps.Values(pods)), func(p *corev1.Pod) bool { return !podReady(p) }) {
+		if now.Before(earliest.Add(certRestartMargin - 24*time.Hour)) {
+			r.event(gw, corev1.EventTypeWarning, "CertificateReloadWaiting",
+				"replicas holding a replaced certificate need a restart, which waits for all replicas to be ready")
+			return degradedRequeue, nil
+		}
+		r.event(gw, corev1.EventTypeWarning, "CertificateReloadForced",
+			"restarting a replica holding a replaced certificate although not all replicas are ready: the certificate it holds may expire within a day")
 	}
 	ords := make([]int, 0, len(due))
 	for o := range due {
@@ -386,7 +466,7 @@ func (r *GatewayReconciler) restartStaleReaders(ctx context.Context, gw *gwv1.Ga
 	sort.Ints(ords)
 	p := pods[ords[0]]
 	log.FromContext(ctx).Info("restarting proxy replica to load a renewed certificate", "pod", p.Name, "certificate", due[ords[0]])
-	r.event(gw, corev1.EventTypeNormal, "CertificateReload", "restarting %s: it may hold the previous certificate of %s, which expires soon", p.Name, due[ords[0]])
+	r.event(gw, corev1.EventTypeNormal, "CertificateReload", "restarting %s: it may hold a replaced certificate of %s", p.Name, due[ords[0]])
 	if err := r.Delete(ctx, p); client.IgnoreNotFound(err) != nil {
 		return 0, err
 	}
@@ -410,23 +490,23 @@ func parseTime(s string) time.Time {
 	return t
 }
 
-// certInfo returns the SHA-256 and expiry of the certificate in a
+// certInfo returns the SHA-256 and validity of the certificate in a
 // certificate Secret; ok is false while it has none, or none that parses.
-func certInfo(s *corev1.Secret) (sum string, notAfter time.Time, ok bool) {
+func certInfo(s *corev1.Secret) (sum string, notBefore, notAfter time.Time, ok bool) {
 	c := s.Data[certSecretKeyCert]
 	if len(c) == 0 || len(s.Data[certSecretKeyKey]) == 0 {
-		return "", time.Time{}, false
+		return "", time.Time{}, time.Time{}, false
 	}
 	block, _ := pem.Decode(c)
 	if block == nil {
-		return "", time.Time{}, false
+		return "", time.Time{}, time.Time{}, false
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return "", time.Time{}, false
+		return "", time.Time{}, time.Time{}, false
 	}
 	h := sha256.Sum256(c)
-	return hex.EncodeToString(h[:]), cert.NotAfter, true
+	return hex.EncodeToString(h[:]), cert.NotBefore, cert.NotAfter, true
 }
 
 // stripStateCerts removes the certificates that replicas issued for

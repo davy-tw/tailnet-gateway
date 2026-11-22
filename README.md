@@ -120,22 +120,31 @@ are still ignored.
 - The proxies get `get`, `update` and `patch` on these Secrets only. All
   replicas share one ServiceAccount, so only tailscaled keeps replicas
   other than 0 from writing.
-- The reading replicas keep a certificate in memory once loaded.
-  `certificateReload` (`PROXY_CERTIFICATE_RELOAD`) picks how they get a
-  renewed one:
+- The reading replicas keep a certificate in memory once loaded, and fail
+  TLS handshakes once it has expired: they never fetch a newer one on
+  their own. `certificateReload` (`PROXY_CERTIFICATE_RELOAD`) picks how
+  they get a renewed one:
   - `restart` (default): the proxies get no `list`, which could not be
     limited to these Secrets. After a renewal, the reading replicas that
     started before it are restarted one at a time (with the usual drain)
-    when the previous certificate has 7 days left. Tailscale renews with
+    when the replaced certificate has 7 days left. Tailscale renews with
     about a third of the lifetime left (30 days for 90-day certificates),
     so a replica restarted for another reason in between is not
-    restarted again. Replica 0 reads the Secret every time and is never
+    restarted again. A certificate replaced with more than 45% of its
+    lifetime left (for example after a revocation), or a certificate
+    Secret deleted by hand, has them restarted at once. If it is renewed
+    again before they restart, the earlier deadline holds. Restarts wait
+    for all replicas to be ready (with a `CertificateReloadWaiting`
+    warning event) until the certificate they hold is about a day from
+    expiring. Replica 0 reads the Secret every time and is never
     restarted. Their logs show a harmless error about listing TLS Secrets
     at startup and daily.
   - `list`: the proxies may list the Secrets of the Gateway's namespace,
     and tailscaled reloads renewed certificates itself, daily, without
-    restarts. They can then read every Secret in that namespace: use it
-    only for Gateways in a namespace of their own.
+    restarts. They can then read every Secret in that namespace,
+    including other Gateways' state Secrets (with their node keys) and
+    auth key Secrets: use it only with one Gateway per namespace, and
+    nothing else secret in it.
 - A Secret whose hostname is no longer served stays granted for 5 minutes,
   while replica 0's mounted serve config catches up (without access it
   would request a certificate it cannot store, again and again). It is
@@ -143,9 +152,9 @@ are still ignored.
   since, as they may still hold its certificate.
 - While replica 0 is down, certificates are not renewed; the ones issued
   keep working until they expire.
-- An HTTPS listener on a port other than 443 gets its certificate when a
-  connection first reaches replica 0. Before that, the other replicas fail
-  its TLS handshakes.
+- Replica 0 requests certificates for new hostnames when it starts and at
+  least hourly after (on port 443 at once). Until it has, the other
+  replicas fail those hostnames' TLS handshakes.
 - Turning it on fills each new shared Secret with a valid certificate a
   replica already has (replica 0's first), removes the per-replica
   certificates from the state Secrets and rolls the pods. Reading replicas

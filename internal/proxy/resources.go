@@ -55,14 +55,15 @@ const (
 )
 
 // Annotations on a certificate Secret, kept by the controller: the
-// SHA-256 and expiry of the certificate it last saw there, and the expiry
-// of the one before it. Replicas that only read certificates keep the one
-// they loaded until restarted, so after a renewal they are restarted
-// before the previous certificate expires.
+// SHA-256 and validity of the certificate it last saw there, and by when
+// the reading replicas started before it must be restarted. Those keep the
+// certificate they loaded until restarted, so after a renewal they are
+// restarted before an older one expires.
 const (
-	AnnotationCertificateSHA256           = config.Domain + "/certificate-sha256"
-	AnnotationCertificateNotAfter         = config.Domain + "/certificate-not-after"
-	AnnotationPreviousCertificateNotAfter = config.Domain + "/previous-certificate-not-after"
+	AnnotationCertificateSHA256    = config.Domain + "/certificate-sha256"
+	AnnotationCertificateNotBefore = config.Domain + "/certificate-not-before"
+	AnnotationCertificateNotAfter  = config.Domain + "/certificate-not-after"
+	AnnotationRestartReadersBy     = config.Domain + "/restart-readers-by"
 )
 
 // CertSecretLabels are the labels of a Gateway's certificate Secrets.
