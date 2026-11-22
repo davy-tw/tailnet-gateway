@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,6 +42,9 @@ const (
 	// (even expired) if the hostname came back.
 	annotationUnusedSince = config.Domain + "/unused-since"
 )
+
+// timeNow is the clock of the certificate bookkeeping, replaced in tests.
+var timeNow = time.Now
 
 // certRestartMargin is how long before the previous certificate expires
 // the reading replicas still holding it are restarted. Tailscale renews
@@ -119,18 +123,27 @@ func readerStartedBefore(pods map[int]*corev1.Pod, t time.Time) bool {
 }
 
 // syncCertSecrets keeps one certificate Secret per name in
-// spec.CertDomains (none without certificate sharing) and tracks the
-// certificates written to them. A Secret whose name is no longer served is
-// deleted once no reading replica may hold its certificate.
-func (r *GatewayReconciler) syncCertSecrets(ctx context.Context, gw *gwv1.Gateway, spec *proxy.Spec, now time.Time) ([]certState, error) {
+// spec.CertDomains (none without certificate sharing), tracks the
+// certificates written to them, and sets spec.CertGrants. It returns when
+// to check again (zero for never).
+//
+// A Secret whose name is no longer served stays granted for
+// certGrantGrace, as replica 0 may still serve the name until its mounted
+// serve config catches up: without access, it would take the Secret for
+// missing, complete an ACME order, fail to store the certificate and try
+// again, using up Let's Encrypt's limit. It is then kept, without a grant,
+// until no reading replica that started before may hold its certificate.
+// With sharing turned off, the Secrets stay granted until no pod runs in
+// cert share mode any more.
+func (r *GatewayReconciler) syncCertSecrets(ctx context.Context, gw *gwv1.Gateway, spec *proxy.Spec, now time.Time) ([]certState, time.Duration, error) {
 	existing, err := r.certSecrets(ctx, gw)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var pods map[int]*corev1.Pod
-	if spec.Params.CertificateSharing && len(existing) > 0 {
+	if len(existing) > 0 {
 		if pods, err = r.proxyPods(ctx, gw); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 	byName := map[string]*corev1.Secret{}
@@ -149,15 +162,22 @@ func (r *GatewayReconciler) syncCertSecrets(ctx context.Context, gw *gwv1.Gatewa
 	}
 	sort.Strings(names)
 
+	var next time.Duration
+	later := func(d time.Duration) {
+		if d > 0 && (next == 0 || d < next) {
+			next = d
+		}
+	}
+	sharing := spec.Params.CertificateSharing
+	stillSharing := sharing || anyPodSharesCerts(pods)
 	stamp := now.UTC().Format(time.RFC3339)
+	spec.CertGrants = nil
 	var states []certState
 	for _, name := range names {
 		cur := byName[name]
-		if !spec.Params.CertificateSharing {
-			// The replicas restart without cert share mode and stop
-			// using these Secrets.
+		if !stillSharing {
 			if err := r.Delete(ctx, cur); client.IgnoreNotFound(err) != nil {
-				return nil, fmt.Errorf("deleting certificate Secret %s: %w", name, err)
+				return nil, 0, fmt.Errorf("deleting certificate Secret %s: %w", name, err)
 			}
 			continue
 		}
@@ -178,21 +198,35 @@ func (r *GatewayReconciler) syncCertSecrets(ctx context.Context, gw *gwv1.Gatewa
 				ann[annotationCertificateObservedAt] = stamp
 			}
 		}
-		if want[name] {
+		grant := true
+		switch {
+		case want[name]:
 			delete(ann, annotationUnusedSince)
-		} else {
+		case !sharing:
+			// Turned off: replica 0 may run in cert share mode until the
+			// rollout reaches it, last.
+		default:
 			if ann[annotationUnusedSince] == "" {
 				ann[annotationUnusedSince] = stamp
 			}
-			if !readerStartedBefore(pods, parseTime(ann[annotationUnusedSince])) {
+			since := parseTime(ann[annotationUnusedSince])
+			if left := since.Add(certGrantGrace).Sub(now); left > 0 {
+				later(left)
+				break
+			}
+			grant = false
+			if !readerStartedBefore(pods, since) {
 				if err := r.Delete(ctx, cur); client.IgnoreNotFound(err) != nil {
-					return nil, fmt.Errorf("deleting certificate Secret %s: %w", name, err)
+					return nil, 0, fmt.Errorf("deleting certificate Secret %s: %w", name, err)
 				}
 				continue
 			}
 		}
 		if err := r.applyOwned(ctx, gw, spec.CertSecret(name, ann)); err != nil {
-			return nil, err
+			return nil, 0, err
+		}
+		if grant {
+			spec.CertGrants = append(spec.CertGrants, name)
 		}
 		if want[name] {
 			states = append(states, certState{
@@ -202,7 +236,86 @@ func (r *GatewayReconciler) syncCertSecrets(ctx context.Context, gw *gwv1.Gatewa
 			})
 		}
 	}
-	return states, nil
+	if !sharing && stillSharing {
+		later(pendingRequeue)
+	}
+	return states, next, nil
+}
+
+// certGrantGrace is how long a name that is no longer served stays granted:
+// longer than the kubelet takes to update a mounted ConfigMap (its sync
+// period plus its cache TTL, a minute each by default).
+const certGrantGrace = 5 * time.Minute
+
+// anyPodSharesCerts reports whether a proxy pod runs in cert share mode.
+func anyPodSharesCerts(pods map[int]*corev1.Pod) bool {
+	for _, p := range pods {
+		for _, c := range p.Spec.Containers {
+			for _, e := range c.Env {
+				if e.Name == proxy.EnvCertShare && e.Value == "true" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// seedCertSecrets fills empty certificate Secrets with a valid certificate
+// that a replica issued for itself before sharing was turned on, so that
+// the replicas restarted in read-only mode have one at once (they never
+// issue) and no new certificate is needed. Replica 0's is preferred.
+func (r *GatewayReconciler) seedCertSecrets(ctx context.Context, gw *gwv1.Gateway, domains []string, now time.Time) error {
+	if len(domains) == 0 {
+		return nil
+	}
+	states, err := r.stateSecrets(ctx, gw)
+	if err != nil {
+		return err
+	}
+	sort.Slice(states, func(i, j int) bool { return states[i].Name < states[j].Name })
+	if i := slices.IndexFunc(states, func(s corev1.Secret) bool { return s.Name == proxy.StateSecretName(gw.Name, 0) }); i > 0 {
+		states[0], states[i] = states[i], states[0]
+	}
+	for _, d := range domains {
+		// From the API server: the Secret may have been created just now,
+		// and the state Secrets are stripped right after.
+		sec := &corev1.Secret{}
+		if err := r.reader().Get(ctx, client.ObjectKey{Namespace: gw.Namespace, Name: d}, sec); err != nil {
+			return fmt.Errorf("reading certificate Secret %s: %w", d, err)
+		}
+		if len(sec.Data[certSecretKeyCert]) > 0 || !metav1.IsControlledBy(sec, gw) {
+			continue
+		}
+		for _, st := range states {
+			cert, key := st.Data[d+".crt"], st.Data[d+".key"]
+			if len(key) == 0 || !certValidFor(cert, d, now) {
+				continue
+			}
+			orig := sec.DeepCopy()
+			sec.Data = map[string][]byte{certSecretKeyCert: cert, certSecretKeyKey: key}
+			if err := r.Patch(ctx, sec, client.MergeFrom(orig)); err != nil {
+				return fmt.Errorf("seeding certificate Secret %s: %w", d, err)
+			}
+			log.FromContext(ctx).Info("seeded shared certificate from a replica's own", "certificate", d, "from", st.Name)
+			break
+		}
+	}
+	return nil
+}
+
+// certValidFor reports whether certPEM is a certificate for name that is
+// valid at now and for at least another day.
+func certValidFor(certPEM []byte, name string, now time.Time) bool {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return false
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false
+	}
+	return cert.VerifyHostname(name) == nil && now.After(cert.NotBefore) && now.Add(24*time.Hour).Before(cert.NotAfter)
 }
 
 // restartStaleReaders restarts, one at a time, the reading replicas that

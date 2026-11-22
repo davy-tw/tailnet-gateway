@@ -136,16 +136,23 @@ are still ignored.
     and tailscaled reloads renewed certificates itself, daily, without
     restarts. They can then read every Secret in that namespace: use it
     only for Gateways in a namespace of their own.
-- A Secret whose hostname is no longer served is kept until every reading
-  replica has started since, as they may still hold its certificate.
+- A Secret whose hostname is no longer served stays granted for 5 minutes,
+  while replica 0's mounted serve config catches up (without access it
+  would request a certificate it cannot store, again and again). It is
+  then kept, without a grant, until every reading replica has started
+  since, as they may still hold its certificate.
 - While replica 0 is down, certificates are not renewed; the ones issued
   keep working until they expire.
 - An HTTPS listener on a port other than 443 gets its certificate when a
   connection first reaches replica 0. Before that, the other replicas fail
   its TLS handshakes.
-- Turning it on removes the per-replica certificates from the state
-  Secrets and rolls the pods. Turning it off deletes the shared Secrets,
-  and every replica requests its own certificates again.
+- Turning it on fills each new shared Secret with a valid certificate a
+  replica already has (replica 0's first), removes the per-replica
+  certificates from the state Secrets and rolls the pods. Reading replicas
+  never issue, so a hostname with no such certificate fails TLS on them
+  until replica 0 has issued one. Turning it off keeps the shared Secrets
+  until no pod runs in cert share mode (replica 0 rolls last), then
+  deletes them; every replica requests its own certificates again.
 
 ### Annotations
 

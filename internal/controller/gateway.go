@@ -522,16 +522,23 @@ func (r *GatewayReconciler) provision(ctx context.Context, gw *gwv1.Gateway, par
 	cm.Annotations = map[string]string{config.AnnotationTailscaleServices: strings.Join(services, ",")}
 	if params.CertificateSharing {
 		spec.CertDomains = res.Config.CertDomains()
-		if err := r.stripStateCerts(ctx, gw); err != nil {
-			return nil, 0, err
-		}
 	}
 	// Before the Role, so that it never names a Secret the Gateway does
 	// not control.
-	now := time.Now()
-	certs, err := r.syncCertSecrets(ctx, gw, spec, now)
+	now := timeNow()
+	certs, certCheck, err := r.syncCertSecrets(ctx, gw, spec, now)
 	if err != nil {
 		return r.currentStatefulSet(ctx, gw), 0, err
+	}
+	if params.CertificateSharing {
+		// Seed before stripping: the per-replica certificates are the
+		// seed.
+		if err := r.seedCertSecrets(ctx, gw, spec.CertDomains, now); err != nil {
+			return nil, 0, err
+		}
+		if err := r.stripStateCerts(ctx, gw); err != nil {
+			return nil, 0, err
+		}
 	}
 	for _, obj := range []client.Object{spec.ServiceAccount(), spec.Role(), spec.RoleBinding(), cm} {
 		if err := r.applyOwned(ctx, gw, obj); err != nil {
@@ -560,6 +567,9 @@ func (r *GatewayReconciler) provision(ctx context.Context, gw *gwv1.Gateway, par
 	again, err := r.restartStaleReaders(ctx, gw, params, certs, now)
 	if err != nil {
 		return nil, 0, err
+	}
+	if certCheck > 0 && (again == 0 || certCheck < again) {
+		again = certCheck
 	}
 	return r.currentStatefulSet(ctx, gw), again, nil
 }

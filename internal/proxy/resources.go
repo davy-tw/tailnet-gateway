@@ -75,6 +75,9 @@ func CertSecretLabels(gateway string) map[string]string {
 	return l
 }
 
+// EnvCertShare turns on Tailscale's cert share mode in the proxy image.
+const EnvCertShare = "TS_EXPERIMENTAL_CERT_SHARE"
+
 // StateSecretName is the state Secret of replica i.
 func StateSecretName(gateway string, i int) string { return fmt.Sprintf("%s-%d", gateway, i) }
 
@@ -102,6 +105,10 @@ type Spec struct {
 	// CertDomains are the TLS server names whose certificates replica 0
 	// issues for the others (Params.CertificateSharing only).
 	CertDomains []string
+	// CertGrants are the certificate Secrets the proxies may read and
+	// write: CertDomains, and for a while names that are no longer served
+	// (see the controller).
+	CertGrants []string
 }
 
 // ListSecrets reports whether the proxies may list the Secrets of their
@@ -144,13 +151,11 @@ func (s *Spec) ServiceAccount() *corev1.ServiceAccount {
 // writing. List is only given with the "list" reload, since it cannot be
 // limited to these Secrets.
 func (s *Spec) Role() *rbacv1.Role {
-	names := make([]string, 0, int(s.Params.Replicas)+len(s.CertDomains))
+	names := make([]string, 0, int(s.Params.Replicas)+len(s.CertGrants))
 	for i := 0; i < int(s.Params.Replicas); i++ {
 		names = append(names, StateSecretName(s.Gateway, i))
 	}
-	if s.Params.CertificateSharing {
-		names = append(names, s.CertDomains...)
-	}
+	names = append(names, s.CertGrants...)
 	rules := []rbacv1.PolicyRule{
 		{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: names, Verbs: []string{"get", "update", "patch"}},
 		{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},
@@ -324,7 +329,7 @@ func (s *Spec) StatefulSet() *appsv1.StatefulSet {
 		// The image's entrypoint makes the pod whose name ends in "-0"
 		// the only one that issues and renews certificates ("rw"); the
 		// others only read them ("ro").
-		env = append(env, corev1.EnvVar{Name: "TS_EXPERIMENTAL_CERT_SHARE", Value: "true"})
+		env = append(env, corev1.EnvVar{Name: EnvCertShare, Value: "true"})
 	}
 	selector := &metav1.LabelSelector{MatchLabels: SelectorLabels(s.Gateway)}
 	return &appsv1.StatefulSet{

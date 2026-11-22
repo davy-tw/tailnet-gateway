@@ -92,7 +92,7 @@ func TestCertificateSharing(t *testing.T) {
 		return env
 	}
 	off := spec(2)
-	off.CertDomains = []string{"web.tail1234.ts.net"} // ignored while off
+	off.CertDomains = []string{"web.tail1234.ts.net"} // only CertGrants are granted
 	if _, ok := envOf(off)["TS_EXPERIMENTAL_CERT_SHARE"]; ok {
 		t.Error("cert share env set while off")
 	}
@@ -103,6 +103,7 @@ func TestCertificateSharing(t *testing.T) {
 	on := spec(2)
 	on.Params.CertificateSharing = true
 	on.CertDomains = []string{"web.tail1234.ts.net"}
+	on.CertGrants = on.CertDomains
 	if envOf(on)["TS_EXPERIMENTAL_CERT_SHARE"] != "true" {
 		t.Error("cert share env missing")
 	}

@@ -107,7 +107,7 @@ func TestEnvtestCertificateSharing(t *testing.T) {
 	if sec.Annotations[proxy.AnnotationPreviousCertificateNotAfter] != first.UTC().Format(time.RFC3339) {
 		t.Errorf("annotations after a renewal = %v", sec.Annotations)
 	}
-	states, err := r.syncCertSecrets(e.ctx, gatewayOf(e, "c", "gw"), certSpec(r, e, "c", "gw", cfg.Defaults, domain), time.Now())
+	states, _, err := r.syncCertSecrets(e.ctx, gatewayOf(e, "c", "gw"), certSpec(r, e, "c", "gw", cfg.Defaults, domain), time.Now())
 	if err != nil || len(states) != 1 {
 		t.Fatalf("states = %+v, %v", states, err)
 	}
@@ -153,19 +153,31 @@ func TestEnvtestCertificateSharing(t *testing.T) {
 		t.Errorf("state Secret keys = %v", keys(state.Data))
 	}
 
-	// A name no longer served keeps its Secret, without a grant, while a
-	// reading replica that started before may hold its certificate.
+	// A name no longer served stays granted for a while, as replica 0 may
+	// not have its new serve config yet.
 	gw := gatewayOf(e, "c", "gw")
 	gw.Spec.Listeners[0].Port = 80
 	gw.Spec.Listeners[0].Protocol = gwv1.HTTPProtocolType
 	if err := e.c.Update(e.ctx, gw); err != nil {
 		t.Fatal(err)
 	}
-	reconcile()
+	if res := reconcile(); res.RequeueAfter == 0 || res.RequeueAfter > certGrantGrace {
+		t.Errorf("requeue after %v during the grant grace", res.RequeueAfter)
+	}
 	sec = certSecret()
 	if sec.Annotations[annotationUnusedSince] == "" {
 		t.Errorf("unused Secret annotations = %v", sec.Annotations)
 	}
+	_ = e.get("c", "gw", role)
+	if got := strings.Join(role.Rules[0].ResourceNames, ","); got != "gw-0,gw-1,"+domain {
+		t.Errorf("Role resourceNames during the grant grace = %s", got)
+	}
+	// Then it keeps its Secret, without a grant, while a reading replica
+	// that started before may hold its certificate.
+	timeNow = func() time.Time { return time.Now().Add(certGrantGrace + time.Minute) }
+	t.Cleanup(func() { timeNow = time.Now })
+	reconcile()
+	certSecret()
 	_ = e.get("c", "gw", role)
 	if got := strings.Join(role.Rules[0].ResourceNames, ","); got != "gw-0,gw-1" {
 		t.Errorf("Role resourceNames for an unused name = %s", got)
@@ -195,7 +207,17 @@ func TestEnvtestCertificateSharing(t *testing.T) {
 	}
 	reconcile()
 	certSecret()
+	// Turned off, the Secrets stay granted while a pod (replica 0, rolled
+	// last) still runs in cert share mode.
+	replacePod(e, "c", "gw", 0, true)
 	cfg.Defaults.CertificateSharing = false
+	reconcile()
+	certSecret()
+	_ = e.get("c", "gw", role)
+	if got := strings.Join(role.Rules[0].ResourceNames, ","); got != "gw-0,gw-1,"+domain {
+		t.Errorf("Role resourceNames while replica 0 still shares = %s", got)
+	}
+	replacePod(e, "c", "gw", 0, false)
 	reconcile()
 	if err := e.get("c", domain, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 		t.Errorf("certificate Secret kept after turning sharing off: %v", err)
@@ -203,6 +225,70 @@ func TestEnvtestCertificateSharing(t *testing.T) {
 	_ = e.get("c", "gw", role)
 	if got := strings.Join(role.Rules[0].ResourceNames, ","); got != "gw-0,gw-1" {
 		t.Errorf("Role resourceNames while off = %s", got)
+	}
+}
+
+// TestEnvtestCertificateSeeding fills a new shared Secret with a valid
+// certificate a replica issued for itself, replica 0's first, before the
+// state Secrets are stripped.
+func TestEnvtestCertificateSeeding(t *testing.T) {
+	e := startEnv(t, false)
+	cfg := *e.cfg
+	cfg.ControllerName = "example.com/certs"
+	cfg.TailnetDomain = "tail1234.ts.net"
+	r := NewGatewayReconciler(e.c, e.scheme, &cfg, nil, AllFeatures(), nil)
+	const domain = "gw.tail1234.ts.net"
+	e.create(namespace("s"), backendService("s", "app", 80),
+		&gwv1.GatewayClass{ObjectMeta: metav1.ObjectMeta{Name: "certs"}, Spec: gwv1.GatewayClassSpec{ControllerName: "example.com/certs"}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "s", Name: "gw"}, StringData: map[string]string{"authkey": "tskey-auth-user"}},
+		&gwv1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: "s", Name: "gw"}, Spec: gwv1.GatewaySpec{GatewayClassName: "certs",
+			Listeners: []gwv1.Listener{{Name: "https", Protocol: gwv1.HTTPSProtocolType, Port: 443}}}},
+		rootRoute("s", "r", "gw", "app"),
+	)
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "s", Name: "gw"}}
+	if _, err := r.Reconcile(e.ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	certs := map[int][]byte{
+		0: testCert(t, domain, time.Now().Add(80*24*time.Hour)),
+		1: testCert(t, domain, time.Now().Add(85*24*time.Hour)),
+	}
+	for i, c := range certs {
+		s := &corev1.Secret{}
+		if err := e.get("s", proxy.StateSecretName("gw", i), s); err != nil {
+			t.Fatal(err)
+		}
+		s.Data[domain+".crt"] = c
+		s.Data[domain+".key"] = []byte(fmt.Sprintf("key%d", i))
+		if err := e.c.Update(e.ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg.Defaults.CertificateSharing = true
+	if _, err := r.Reconcile(e.ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	sec := &corev1.Secret{}
+	if err := e.get("s", domain, sec); err != nil {
+		t.Fatal(err)
+	}
+	if string(sec.Data["tls.crt"]) != string(certs[0]) || string(sec.Data["tls.key"]) != "key0" {
+		t.Errorf("shared Secret not seeded from replica 0: %v", keys(sec.Data))
+	}
+	for i := range certs {
+		s := &corev1.Secret{}
+		_ = e.get("s", proxy.StateSecretName("gw", i), s)
+		if _, ok := s.Data[domain+".crt"]; ok {
+			t.Errorf("replica %d keeps its certificate", i)
+		}
+	}
+	// The controller's later applies leave the seeded certificate alone.
+	if _, err := r.Reconcile(e.ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	_ = e.get("s", domain, sec)
+	if string(sec.Data["tls.crt"]) != string(certs[0]) || sec.Annotations[proxy.AnnotationCertificateSHA256] == "" {
+		t.Errorf("seeded Secret after another reconcile: data %v, annotations %v", keys(sec.Data), sec.Annotations)
 	}
 }
 
@@ -242,9 +328,25 @@ func rootRoute(ns, name, gateway, backend string) *gwv1.HTTPRoute {
 	}}
 }
 
+// replacePod replaces a proxy pod, in cert share mode or not.
+func replacePod(e *env, ns, gw string, ord int, shares bool) {
+	e.t.Helper()
+	name := fmt.Sprintf("%s-%d", gw, ord)
+	if err := e.c.Delete(e.ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}}, client.GracePeriodSeconds(0)); client.IgnoreNotFound(err) != nil {
+		e.t.Fatal(err)
+	}
+	e.eventually("pod "+name+" gone", func() error {
+		if err := e.get(ns, name, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+			return fmt.Errorf("still there: %v", err)
+		}
+		return nil
+	})
+	createProxyPods(e, ns, gw, ord+1, shares)
+}
+
 // createProxyPods stands in for the StatefulSet controller: it creates the
-// missing replicas as ready pods.
-func createProxyPods(e *env, ns, gw string, n int) []*corev1.Pod {
+// missing replicas as ready pods, in cert share mode if shares is true.
+func createProxyPods(e *env, ns, gw string, n int, shares ...bool) []*corev1.Pod {
 	e.t.Helper()
 	var out []*corev1.Pod
 	for i := 0; i < n; i++ {
@@ -258,6 +360,9 @@ func createProxyPods(e *env, ns, gw string, n int) []*corev1.Pod {
 			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, Labels: proxy.SelectorLabels(gw),
 				OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: gw, UID: "sts", Controller: ptr.To(true)}}},
 			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "tailscale", Image: "img"}}},
+		}
+		if len(shares) > 0 && shares[0] {
+			p.Spec.Containers[0].Env = []corev1.EnvVar{{Name: proxy.EnvCertShare, Value: "true"}}
 		}
 		e.create(p)
 		p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
