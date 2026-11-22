@@ -74,6 +74,9 @@ type certState struct {
 	// restartBy is when the reading replicas started before observedAt
 	// must be restarted; zero if none need to be.
 	restartBy time.Time
+	// heldNotAfter is when the oldest certificate those replicas may hold
+	// expires; zero if unknown.
+	heldNotAfter time.Time
 }
 
 // certSecrets returns the certificate Secrets the Gateway controls.
@@ -196,7 +199,7 @@ func (r *GatewayReconciler) syncCertSecrets(ctx context.Context, gw *gwv1.Gatewa
 		ann := map[string]string{}
 		if cur != nil {
 			for _, k := range []string{proxy.AnnotationCertificateSHA256, proxy.AnnotationCertificateNotBefore,
-				proxy.AnnotationCertificateNotAfter, proxy.AnnotationRestartReadersBy,
+				proxy.AnnotationCertificateNotAfter, proxy.AnnotationRestartReadersBy, proxy.AnnotationReadersCertificateNotAfter,
 				annotationCertificateObservedAt, annotationUnusedSince} {
 				if v := cur.Annotations[k]; v != "" {
 					ann[k] = v
@@ -241,9 +244,10 @@ func (r *GatewayReconciler) syncCertSecrets(ctx context.Context, gw *gwv1.Gatewa
 		}
 		if want[name] {
 			states = append(states, certState{
-				name:       name,
-				observedAt: parseTime(ann[annotationCertificateObservedAt]),
-				restartBy:  parseTime(ann[proxy.AnnotationRestartReadersBy]),
+				name:         name,
+				observedAt:   parseTime(ann[annotationCertificateObservedAt]),
+				restartBy:    parseTime(ann[proxy.AnnotationRestartReadersBy]),
+				heldNotAfter: parseTime(ann[proxy.AnnotationReadersCertificateNotAfter]),
 			})
 		}
 	}
@@ -265,6 +269,7 @@ func trackCertificate(ann map[string]string, cur *corev1.Secret, pods map[int]*c
 	observed := parseTime(ann[annotationCertificateObservedAt])
 	if !observed.IsZero() && !readerStartedBefore(pods, observed) {
 		delete(ann, proxy.AnnotationRestartReadersBy)
+		delete(ann, proxy.AnnotationReadersCertificateNotAfter)
 	}
 	sum, notBefore, notAfter, ok := certInfo(cur)
 	if !ok || sum == ann[proxy.AnnotationCertificateSHA256] {
@@ -272,6 +277,7 @@ func trackCertificate(ann map[string]string, cur *corev1.Secret, pods map[int]*c
 	}
 	if ann[proxy.AnnotationCertificateSHA256] != "" {
 		oldBefore, oldAfter := parseTime(ann[proxy.AnnotationCertificateNotBefore]), parseTime(ann[proxy.AnnotationCertificateNotAfter])
+		hadRestart := ann[proxy.AnnotationRestartReadersBy] != ""
 		by := oldAfter.Add(-certRestartMargin)
 		if life := oldAfter.Sub(oldBefore); !oldBefore.IsZero() && life > 0 &&
 			float64(oldAfter.Sub(now)) > earlyRenewal*float64(life) {
@@ -282,6 +288,15 @@ func trackCertificate(ann map[string]string, cur *corev1.Secret, pods map[int]*c
 		}
 		if !oldAfter.IsZero() {
 			ann[proxy.AnnotationRestartReadersBy] = by.UTC().Format(time.RFC3339)
+			// The oldest certificate the readers may hold. Unknown (after a
+			// Secret deleted by hand) stays unknown until they restart.
+			held := oldAfter
+			if prev := parseTime(ann[proxy.AnnotationReadersCertificateNotAfter]); !prev.IsZero() && prev.Before(held) {
+				held = prev
+			}
+			if !hadRestart || ann[proxy.AnnotationReadersCertificateNotAfter] != "" {
+				ann[proxy.AnnotationReadersCertificateNotAfter] = held.UTC().Format(time.RFC3339)
+			}
 		}
 	}
 	ann[proxy.AnnotationCertificateSHA256] = sum
@@ -333,7 +348,7 @@ func anyPodSharesCerts(pods map[int]*corev1.Pod) bool {
 // seedCertSecrets fills empty certificate Secrets with a valid certificate
 // that a replica issued for itself before sharing was turned on, so that
 // the replicas restarted in read-only mode have one at once (they never
-// issue) and no new certificate is needed. Replica 0's is preferred.
+// issue) and no new certificate is needed.
 func (r *GatewayReconciler) seedCertSecrets(ctx context.Context, gw *gwv1.Gateway, domains []string, now time.Time) error {
 	if len(domains) == 0 {
 		return nil
@@ -356,21 +371,45 @@ func (r *GatewayReconciler) seedCertSecrets(ctx context.Context, gw *gwv1.Gatewa
 		if len(sec.Data[certSecretKeyCert]) > 0 || !metav1.IsControlledBy(sec, gw) {
 			continue
 		}
-		for _, st := range states {
+		// The one valid longest, so that replica 0 does not renew it (and
+		// the readers restart again) soon; replica 0's on a tie.
+		var best *corev1.Secret
+		var bestAfter time.Time
+		for i := range states {
+			st := &states[i]
 			cert, key := st.Data[d+".crt"], st.Data[d+".key"]
 			if len(key) == 0 || !certValidFor(cert, d, now) {
 				continue
 			}
-			orig := sec.DeepCopy()
-			sec.Data = map[string][]byte{certSecretKeyCert: cert, certSecretKeyKey: key}
-			if err := r.Patch(ctx, sec, client.MergeFrom(orig)); err != nil {
-				return fmt.Errorf("seeding certificate Secret %s: %w", d, err)
+			if after := certNotAfter(cert); best == nil || after.After(bestAfter) {
+				best, bestAfter = st, after
 			}
-			log.FromContext(ctx).Info("seeded shared certificate from a replica's own", "certificate", d, "from", st.Name)
-			break
 		}
+		if best == nil {
+			continue
+		}
+		orig := sec.DeepCopy()
+		sec.Data = map[string][]byte{certSecretKeyCert: best.Data[d+".crt"], certSecretKeyKey: best.Data[d+".key"]}
+		if err := r.Patch(ctx, sec, client.MergeFrom(orig)); err != nil {
+			return fmt.Errorf("seeding certificate Secret %s: %w", d, err)
+		}
+		log.FromContext(ctx).Info("seeded shared certificate from a replica's own", "certificate", d, "from", best.Name)
 	}
 	return nil
+}
+
+// certNotAfter returns the expiry of a PEM certificate, zero if it does
+// not parse.
+func certNotAfter(certPEM []byte) time.Time {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return time.Time{}
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return time.Time{}
+	}
+	return cert.NotAfter
 }
 
 // certValidFor reports whether certPEM is a certificate for name that is
@@ -402,7 +441,7 @@ func (r *GatewayReconciler) restartStaleReaders(ctx context.Context, gw *gwv1.Ga
 	list := params.CertificateReload == config.CertificateReloadList
 	var pods map[int]*corev1.Pod
 	var next time.Duration
-	var earliest time.Time
+	var forceAt time.Time // when to restart even if not all replicas are ready
 	due := map[int]string{}
 	for _, st := range states {
 		if st.restartBy.IsZero() || st.observedAt.IsZero() {
@@ -436,8 +475,14 @@ func (r *GatewayReconciler) restartStaleReaders(ctx context.Context, gw *gwv1.Ga
 				due[ord] = st.name
 			}
 		}
-		if earliest.IsZero() || deadline.Before(earliest) {
-			earliest = deadline
+		// A day before the held certificate expires, or at once if its
+		// expiry is unknown.
+		force := now
+		if !st.heldNotAfter.IsZero() {
+			force = st.heldNotAfter.Add(-24 * time.Hour)
+		}
+		if forceAt.IsZero() || force.Before(forceAt) {
+			forceAt = force
 		}
 	}
 	if len(due) == 0 {
@@ -451,7 +496,7 @@ func (r *GatewayReconciler) restartStaleReaders(ctx context.Context, gw *gwv1.Ga
 	// Only while all the others serve, unless waiting would let the
 	// certificate they hold expire.
 	if int32(len(pods)) != params.Replicas || slices.ContainsFunc(slices.Collect(maps.Values(pods)), func(p *corev1.Pod) bool { return !podReady(p) }) {
-		if now.Before(earliest.Add(certRestartMargin - 24*time.Hour)) {
+		if now.Before(forceAt) {
 			r.event(gw, corev1.EventTypeWarning, "CertificateReloadWaiting",
 				"replicas holding a replaced certificate need a restart, which waits for all replicas to be ready")
 			return degradedRequeue, nil

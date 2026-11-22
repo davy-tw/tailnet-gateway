@@ -136,7 +136,8 @@ are still ignored.
     again before they restart, the earlier deadline holds. Restarts wait
     for all replicas to be ready (with a `CertificateReloadWaiting`
     warning event) until the certificate they hold is about a day from
-    expiring. Replica 0 reads the Secret every time and is never
+    expiring (at once when its expiry is unknown, after a Secret deleted
+    by hand). Replica 0 reads the Secret every time and is never
     restarted. Their logs show a harmless error about listing TLS Secrets
     at startup and daily.
   - `list`: the proxies may list the Secrets of the Gateway's namespace,
@@ -155,8 +156,8 @@ are still ignored.
 - Replica 0 requests certificates for new hostnames when it starts and at
   least hourly after (on port 443 at once). Until it has, the other
   replicas fail those hostnames' TLS handshakes.
-- Turning it on fills each new shared Secret with a valid certificate a
-  replica already has (replica 0's first), removes the per-replica
+- Turning it on fills each new shared Secret with the valid certificate a
+  replica already has that is valid longest, removes the per-replica
   certificates from the state Secrets and rolls the pods. Reading replicas
   never issue, so a hostname with no such certificate fails TLS on them
   until replica 0 has issued one. Turning it off keeps the shared Secrets

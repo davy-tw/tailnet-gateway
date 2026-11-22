@@ -64,6 +64,9 @@ const (
 	AnnotationCertificateNotBefore = config.Domain + "/certificate-not-before"
 	AnnotationCertificateNotAfter  = config.Domain + "/certificate-not-after"
 	AnnotationRestartReadersBy     = config.Domain + "/restart-readers-by"
+	// AnnotationReadersCertificateNotAfter is the expiry of the oldest
+	// certificate those replicas may hold, when known.
+	AnnotationReadersCertificateNotAfter = config.Domain + "/readers-certificate-not-after"
 )
 
 // CertSecretLabels are the labels of a Gateway's certificate Secrets.

@@ -25,6 +25,9 @@ func TestTrackCertificate(t *testing.T) {
 		1: {ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now.Add(-200 * day))}},
 	}
 	by := func(ann map[string]string) time.Time { return parseTime(ann[proxy.AnnotationRestartReadersBy]) }
+	held := func(ann map[string]string) time.Time {
+		return parseTime(ann[proxy.AnnotationReadersCertificateNotAfter])
+	}
 
 	// First certificate (issued 60 days ago, 30 left): nothing to restart.
 	ann := map[string]string{}
@@ -36,8 +39,8 @@ func TestTrackCertificate(t *testing.T) {
 
 	// Usual renewal: 7 days before the replaced one expires.
 	trackCertificate(ann, secret(now, now.Add(90*day)), pods, now)
-	if want := now.Add(23 * day); !by(ann).Equal(want) {
-		t.Errorf("restart-by = %v, want %v", by(ann), want)
+	if want := now.Add(23 * day); !by(ann).Equal(want) || !held(ann).Equal(now.Add(30*day)) {
+		t.Errorf("restart-by = %v, want %v; held %v", by(ann), want, held(ann))
 	}
 
 	// Renewed again before the readers restarted (the new one was revoked,
@@ -45,8 +48,8 @@ func TestTrackCertificate(t *testing.T) {
 	later := now.Add(2 * day)
 	c3 := secret(later, later.Add(90*day))
 	trackCertificate(ann, c3, pods, later)
-	if !by(ann).Equal(later) {
-		t.Errorf("restart-by after an early renewal = %v, want %v", by(ann), later)
+	if !by(ann).Equal(later) || !held(ann).Equal(now.Add(30*day)) {
+		t.Errorf("restart-by after an early renewal = %v, want %v; held %v", by(ann), later, held(ann))
 	}
 
 	// Once every reader started after the current certificate, it goes.
@@ -68,4 +71,13 @@ func TestTrackCertificate(t *testing.T) {
 		t.Errorf("restart-by = %v (first %v)", by(ann), first)
 	}
 	_ = c1
+
+	// After a Secret deleted by hand the held expiry is unknown, and stays
+	// so through a renewal.
+	ann = map[string]string{proxy.AnnotationRestartReadersBy: now.Format(time.RFC3339)}
+	trackCertificate(ann, secret(now.Add(-60*day), now.Add(30*day)), pods, now)
+	trackCertificate(ann, secret(now, now.Add(90*day)), pods, now)
+	if !held(ann).IsZero() || !by(ann).Equal(now) {
+		t.Errorf("after a deleted Secret: restart-by %v, held %v", by(ann), held(ann))
+	}
 }

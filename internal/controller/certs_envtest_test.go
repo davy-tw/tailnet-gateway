@@ -247,9 +247,9 @@ func TestEnvtestCertificateSharing(t *testing.T) {
 	}
 }
 
-// TestEnvtestCertificateSeeding fills a new shared Secret with a valid
-// certificate a replica issued for itself, replica 0's first, before the
-// state Secrets are stripped.
+// TestEnvtestCertificateSeeding fills a new shared Secret with the valid
+// certificate a replica issued for itself that is valid longest, before
+// the state Secrets are stripped.
 func TestEnvtestCertificateSeeding(t *testing.T) {
 	e := startEnv(t, false)
 	cfg := *e.cfg
@@ -291,8 +291,8 @@ func TestEnvtestCertificateSeeding(t *testing.T) {
 	if err := e.get("s", domain, sec); err != nil {
 		t.Fatal(err)
 	}
-	if string(sec.Data["tls.crt"]) != string(certs[0]) || string(sec.Data["tls.key"]) != "key0" {
-		t.Errorf("shared Secret not seeded from replica 0: %v", keys(sec.Data))
+	if string(sec.Data["tls.crt"]) != string(certs[1]) || string(sec.Data["tls.key"]) != "key1" {
+		t.Errorf("shared Secret not seeded from the longest valid certificate: %v", keys(sec.Data))
 	}
 	for i := range certs {
 		s := &corev1.Secret{}
@@ -306,7 +306,7 @@ func TestEnvtestCertificateSeeding(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = e.get("s", domain, sec)
-	if string(sec.Data["tls.crt"]) != string(certs[0]) || sec.Annotations[proxy.AnnotationCertificateSHA256] == "" {
+	if string(sec.Data["tls.crt"]) != string(certs[1]) || sec.Annotations[proxy.AnnotationCertificateSHA256] == "" {
 		t.Errorf("seeded Secret after another reconcile: data %v, annotations %v", keys(sec.Data), sec.Annotations)
 	}
 }
