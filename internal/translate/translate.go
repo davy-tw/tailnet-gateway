@@ -632,6 +632,9 @@ func (t *translator) prepareListenerSets() {
 		}
 	}
 	rank := 0
+	// declaredPorts approximates the listeners merged so far: the
+	// Gateway's, then the declaring ListenerSet listeners.
+	declaredPorts := append([]*listenerState(nil), t.earlier...)
 	for _, ls := range sets {
 		ss := &setState{ls: ls, allowed: t.listenerSetAllowed(ls)}
 		key := types.NamespacedName{Namespace: ls.Namespace, Name: ls.Name}
@@ -644,9 +647,21 @@ func (t *translator) prepareListenerSets() {
 		ss.rank = rank
 		for _, e := range ls.Spec.Listeners {
 			label := t.listenerLabel(e.Hostname)
-			if _, taken := t.declared[label]; label == "" || taken || compatibleKinds(e.Protocol) == nil {
+			if _, taken := t.declared[label]; label == "" || taken {
 				continue
 			}
+			// Only a listener that will be accepted declares its hostname:
+			// a supported protocol and no port conflict with the
+			// listeners before it. (Label conflicts with earlier owners
+			// are settled by ownLabel and buildSetListeners.)
+			l := entryListener(e)
+			if !t.newListener(l, ls.Namespace, ss, ls.Generation).accepted {
+				continue
+			}
+			if reason, _ := t.conflictWith(l, declaredPorts); reason != "" {
+				continue
+			}
+			declaredPorts = append(declaredPorts, &listenerState{l: l, family: protocolFamily(l.Protocol), set: ss})
 			t.declared[label] = declaration{rank: rank, listener: e.Name, set: ls, created: ls.CreationTimestamp}
 		}
 	}
@@ -1556,9 +1571,6 @@ func (t *translator) claimed(label string) string {
 // ownLabel takes label for the owner of rank, or returns a conflict
 // message when another owner of the Gateway (the Gateway itself or another
 // ListenerSet) holds it.
-//
-// A route that already uses label through one parent may use it through
-// another: it adds nothing that is not its own.
 //
 // A label that no owner holds yet, but that a ListenerSet listener of
 // another owner names in its hostname, goes to the older of the two: the

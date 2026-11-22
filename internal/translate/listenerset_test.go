@@ -592,3 +592,21 @@ func TestListenerSetHostnameOlderThanGatewayRoute(t *testing.T) {
 		t.Errorf("config = %s", mustJSON(t, res.Config))
 	}
 }
+
+// A ListenerSet listener that is not accepted (here a protocol conflict
+// with the Gateway) does not hold its hostname against newer routes.
+func TestListenerSetRejectedListenerDeclaresNothing(t *testing.T) {
+	gw := allowListeners(gateway(listener("raw", gwv1.TCPProtocolType, 9000), allNamespaces(listener("http", gwv1.HTTPProtocolType, 80))), gwv1.NamespacesFromAll, nil)
+	shop := httpRoute("infra", "shop", 30, []string{"shop"}, rule(backendRef("shop", 80)))
+	shop.Spec.ParentRefs[0].SectionName = ptr.To(gwv1.SectionName("http"))
+	res := Translate(&Input{
+		Gateway: gw, TailnetDomain: domain,
+		ListenerSets: []*gwv1.ListenerSet{listenerSet("team", "bad", 1, entry("b", gwv1.HTTPProtocolType, 9000, "shop"))},
+		HTTPRoutes:   []*gwv1.HTTPRoute{shop},
+	})
+	expectCond(t, setListener(t, setResult(t, res, "team", "bad"), "b").Conditions, "Conflicted", metav1.ConditionTrue, "ProtocolConflict")
+	expectCond(t, routeConds(t, res, KindHTTPRoute, "shop"), "Accepted", metav1.ConditionTrue, "Accepted")
+	if res.Config.Services["svc:shop"] == nil {
+		t.Errorf("config = %s", mustJSON(t, res.Config))
+	}
+}
