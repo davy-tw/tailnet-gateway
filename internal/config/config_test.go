@@ -20,7 +20,7 @@ func TestLoadDefaults(t *testing.T) {
 	if c.ControllerName != DefaultControllerName {
 		t.Errorf("controller name = %q", c.ControllerName)
 	}
-	want := ClassParams{Replicas: 2, Image: DefaultProxyImage, DrainGracePeriod: 30 * time.Second}
+	want := ClassParams{Replicas: 2, Image: DefaultProxyImage, DrainGracePeriod: 30 * time.Second, CertificateReload: CertificateReloadRestart}
 	if !reflect.DeepEqual(c.Defaults, want) {
 		t.Errorf("defaults = %+v, want %+v", c.Defaults, want)
 	}
@@ -72,19 +72,20 @@ func TestParseClassParams(t *testing.T) {
 		"replicas":           "3",
 		"drainGracePeriod":   "45s",
 		"certificateSharing": "true",
+		"certificateReload":  "list",
 		"color":              "blue",
 	}, def)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(p.Tags, []string{"tag:prod"}) || p.Replicas != 3 || p.Image != "img" || p.DrainGracePeriod != 45*time.Second || !p.CertificateSharing {
+	if !reflect.DeepEqual(p.Tags, []string{"tag:prod"}) || p.Replicas != 3 || p.Image != "img" || p.DrainGracePeriod != 45*time.Second || !p.CertificateSharing || p.CertificateReload != "list" {
 		t.Errorf("params = %+v", p)
 	}
 	if !reflect.DeepEqual(unknown, []string{"color"}) {
 		t.Errorf("unknown = %v", unknown)
 	}
 	for _, bad := range []map[string]string{
-		{"replicas": "0"}, {"replicas": "x"}, {"replicas": "65"}, {"drainGracePeriod": "soon"}, {"tags": "tag:"}, {"image": "a b"}, {"certificateSharing": "sometimes"},
+		{"replicas": "0"}, {"replicas": "x"}, {"replicas": "65"}, {"drainGracePeriod": "soon"}, {"tags": "tag:"}, {"image": "a b"}, {"certificateSharing": "sometimes"}, {"certificateReload": "never"},
 	} {
 		if _, _, err := ParseClassParams(bad, def); err == nil {
 			t.Errorf("%v: expected error", bad)

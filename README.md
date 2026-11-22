@@ -80,6 +80,7 @@ defaults that a GatewayClass can override.
 | `PROXY_IMAGE` (per class) | `tailscale/tailscale:v1.104.7` | Proxy image |
 | `PROXY_DRAIN_GRACE_PERIOD` (per class) | `30s` | Pod termination grace period, covering the drain |
 | `PROXY_CERTIFICATE_SHARING` (per class) | `false` | Only replica 0 issues TLS certificates and shares them (see [Certificate sharing](#certificate-sharing)) |
+| `PROXY_CERTIFICATE_RELOAD` (per class) | `restart` | How the other replicas load renewed certificates: `restart` or `list` |
 | `GATEWAY_CONTROLLER_NAME` | `tailnet-gateway.davy.tw/gateway-controller` | Every GatewayClass with this `controllerName` is served |
 | `DEFAULT_GATEWAY_CLASS` | `tailnet` | Class for Gateways generated from Ingresses and Services |
 | `INGRESS_CLASS` | `tailnet` | IngressClass served (also when it is the cluster default) |
@@ -93,7 +94,7 @@ defaults that a GatewayClass can override.
 
 A GatewayClass may point `spec.parametersRef` at a ConfigMap (group `""`,
 kind `ConfigMap`, with a namespace) with any of `tags`, `replicas`, `image`,
-`drainGracePeriod` and `certificateSharing`. Invalid values set `Accepted=False` with reason
+`drainGracePeriod`, `certificateSharing` and `certificateReload`. Invalid values set `Accepted=False` with reason
 `InvalidParameters` on the class, and its Gateways stop serving until the
 class is valid again. See
 `examples/classes.yaml`. Tags are under the class owner's control: Gateways
@@ -112,18 +113,31 @@ With `certificateSharing: "true"` (or `PROXY_CERTIFICATE_SHARING=true`),
 the proxies run Tailscale's experimental cert share mode: replica 0 issues
 and renews the certificates, and the other replicas only read them. The
 controller creates one Secret per hostname in the Gateway's namespace,
-named after the hostname (`<name>.<tailnet>.ts.net`), and removes it with
-the hostname. Their names cannot be chosen, and listener `certificateRefs`
+named after the hostname (`<name>.<tailnet>.ts.net`), and removes it after
+the hostname is gone. Their names cannot be chosen, and listener `certificateRefs`
 are still ignored.
 
-- The proxies get `get`, `update` and `patch` on these Secrets only, and no
-  `list`: listing could not be limited to them. All replicas share one
-  ServiceAccount, so only tailscaled keeps replicas other than 0 from
-  writing.
-- Without `list`, the reading replicas do not pick up a renewed
-  certificate on their own: a renewal (about every 60 days) rolls the
-  proxy pods. Their logs show a harmless error about listing TLS Secrets
-  at startup and daily.
+- The proxies get `get`, `update` and `patch` on these Secrets only. All
+  replicas share one ServiceAccount, so only tailscaled keeps replicas
+  other than 0 from writing.
+- The reading replicas keep a certificate in memory once loaded.
+  `certificateReload` (`PROXY_CERTIFICATE_RELOAD`) picks how they get a
+  renewed one:
+  - `restart` (default): the proxies get no `list`, which could not be
+    limited to these Secrets. After a renewal, the reading replicas that
+    started before it are restarted one at a time (with the usual drain)
+    when the previous certificate has 7 days left. Tailscale renews with
+    about a third of the lifetime left (30 days for 90-day certificates),
+    so a replica restarted for another reason in between is not
+    restarted again. Replica 0 reads the Secret every time and is never
+    restarted. Their logs show a harmless error about listing TLS Secrets
+    at startup and daily.
+  - `list`: the proxies may list the Secrets of the Gateway's namespace,
+    and tailscaled reloads renewed certificates itself, daily, without
+    restarts. They can then read every Secret in that namespace: use it
+    only for Gateways in a namespace of their own.
+- A Secret whose hostname is no longer served is kept until every reading
+  replica has started since, as they may still hold its certificate.
 - While replica 0 is down, certificates are not renewed; the ones issued
   keep working until they expire.
 - An HTTPS listener on a port other than 443 gets its certificate when a

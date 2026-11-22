@@ -166,6 +166,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	var progErr error
 	var sts *appsv1.StatefulSet
+	var certCheck time.Duration // when certificates need another look
 	switch {
 	case ip != nil:
 		progErr = &pendingError{"GatewayClass parameters are invalid: " + ip.msg}
@@ -174,7 +175,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		progErr = &pendingError{"Gateway is not accepted: " + res.AcceptedMessage}
 		statusErr = errors.Join(statusErr, r.withdraw(ctx, gw))
 	default:
-		sts, progErr = r.provision(ctx, gw, params, res)
+		sts, certCheck, progErr = r.provision(ctx, gw, params, res)
 	}
 	var pe *pendingError
 	if progErr != nil && !errors.As(progErr, &pe) {
@@ -208,7 +209,7 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	case ready < desired:
 		return ctrl.Result{RequeueAfter: degradedRequeue}, nil
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: certCheck}, nil
 }
 
 // routeSet holds every route in the cluster, by kind.
@@ -499,9 +500,9 @@ func ownerRef(gw *gwv1.Gateway) metav1.OwnerReference {
 	}
 }
 
-func (r *GatewayReconciler) provision(ctx context.Context, gw *gwv1.Gateway, params config.ClassParams, res *translate.Result) (*appsv1.StatefulSet, error) {
+func (r *GatewayReconciler) provision(ctx context.Context, gw *gwv1.Gateway, params config.ClassParams, res *translate.Result) (*appsv1.StatefulSet, time.Duration, error) {
 	if len(gw.Name) > maxGatewayNameLength {
-		return nil, &pendingError{fmt.Sprintf("Gateway names longer than %d characters are not supported: "+
+		return nil, 0, &pendingError{fmt.Sprintf("Gateway names longer than %d characters are not supported: "+
 			"the name is used for the proxy StatefulSet and as a label value", maxGatewayNameLength)}
 	}
 	spec := &proxy.Spec{
@@ -513,7 +514,7 @@ func (r *GatewayReconciler) provision(ctx context.Context, gw *gwv1.Gateway, par
 	}
 	cfg, err := res.Config.Marshal()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	cm := spec.ConfigMap(cfg)
 	services := append([]string(nil), res.Services...)
@@ -522,39 +523,45 @@ func (r *GatewayReconciler) provision(ctx context.Context, gw *gwv1.Gateway, par
 	if params.CertificateSharing {
 		spec.CertDomains = res.Config.CertDomains()
 		if err := r.stripStateCerts(ctx, gw); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 	// Before the Role, so that it never names a Secret the Gateway does
 	// not control.
-	if err := r.syncCertSecrets(ctx, gw, spec); err != nil {
-		return r.currentStatefulSet(ctx, gw), err
+	now := time.Now()
+	certs, err := r.syncCertSecrets(ctx, gw, spec, now)
+	if err != nil {
+		return r.currentStatefulSet(ctx, gw), 0, err
 	}
 	for _, obj := range []client.Object{spec.ServiceAccount(), spec.Role(), spec.RoleBinding(), cm} {
 		if err := r.applyOwned(ctx, gw, obj); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 	if pdb := spec.PodDisruptionBudget(); pdb != nil {
 		if err := r.applyOwned(ctx, gw, pdb); err != nil {
-			return nil, fmt.Errorf("applying PodDisruptionBudget: %w", err)
+			return nil, 0, fmt.Errorf("applying PodDisruptionBudget: %w", err)
 		}
 	} else {
 		log.FromContext(ctx).Info("one proxy replica: no PodDisruptionBudget, so a node drain takes the Gateway offline")
 		if err := r.deleteOwned(ctx, gw, &policyv1.PodDisruptionBudget{}, gw.Name); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 	if err := r.ensureStateSecrets(ctx, gw, params); err != nil {
-		return r.currentStatefulSet(ctx, gw), err
+		return r.currentStatefulSet(ctx, gw), 0, err
 	}
 	if err := r.applyOwned(ctx, gw, spec.StatefulSet()); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if err := r.pruneStateSecrets(ctx, gw, params.Replicas); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return r.currentStatefulSet(ctx, gw), nil
+	again, err := r.restartStaleReaders(ctx, gw, params, certs, now)
+	if err != nil {
+		return nil, 0, err
+	}
+	return r.currentStatefulSet(ctx, gw), again, nil
 }
 
 // maxGatewayNameLength keeps the proxy StatefulSet's pods valid: their

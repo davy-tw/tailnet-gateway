@@ -54,15 +54,16 @@ const (
 	LabelTailscaleProxyGroup = "tailscale.com/proxy-group"
 )
 
-// AnnotationIssuedCertificate on a certificate Secret records the SHA-256
-// of the first certificate written to it. Replicas read a certificate
-// when they first need it, so only a later one (a renewal) needs them
-// restarted.
-const AnnotationIssuedCertificate = config.Domain + "/issued-certificate"
-
-// AnnotationCertificates on the pod template carries a hash of the renewed
-// certificates, so that a renewal rolls the replicas onto it.
-const AnnotationCertificates = config.Domain + "/certificates"
+// Annotations on a certificate Secret, kept by the controller: the
+// SHA-256 and expiry of the certificate it last saw there, and the expiry
+// of the one before it. Replicas that only read certificates keep the one
+// they loaded until restarted, so after a renewal they are restarted
+// before the previous certificate expires.
+const (
+	AnnotationCertificateSHA256           = config.Domain + "/certificate-sha256"
+	AnnotationCertificateNotAfter         = config.Domain + "/certificate-not-after"
+	AnnotationPreviousCertificateNotAfter = config.Domain + "/previous-certificate-not-after"
+)
 
 // CertSecretLabels are the labels of a Gateway's certificate Secrets.
 func CertSecretLabels(gateway string) map[string]string {
@@ -101,20 +102,23 @@ type Spec struct {
 	// CertDomains are the TLS server names whose certificates replica 0
 	// issues for the others (Params.CertificateSharing only).
 	CertDomains []string
-	// CertHash changes when a shared certificate is renewed.
-	CertHash string
+}
+
+// ListSecrets reports whether the proxies may list the Secrets of their
+// namespace (certificate sharing with the "list" reload).
+func (s *Spec) ListSecrets() bool {
+	return s.Params.CertificateSharing && s.Params.CertificateReload == config.CertificateReloadList
 }
 
 // CertSecret is the Secret that Tailscale's cert share mode keeps the
 // certificate for domain in. tailscaled names it after the domain and
 // writes its tls.crt and tls.key; it is created empty, since the proxies
-// may not create Secrets. issued is the AnnotationIssuedCertificate value,
-// or "".
-func (s *Spec) CertSecret(domain, issued string) *corev1.Secret {
+// may not create Secrets. annotations are the controller's bookkeeping.
+func (s *Spec) CertSecret(domain string, annotations map[string]string) *corev1.Secret {
 	m := s.meta(domain)
 	m.Labels = CertSecretLabels(s.Gateway)
-	if issued != "" {
-		m.Annotations = map[string]string{AnnotationIssuedCertificate: issued}
+	if len(annotations) > 0 {
+		m.Annotations = annotations
 	}
 	return &corev1.Secret{ObjectMeta: m, Type: corev1.SecretTypeOpaque}
 }
@@ -137,8 +141,8 @@ func (s *Spec) ServiceAccount() *corev1.ServiceAccount {
 // and, with certificate sharing, the Gateway's certificate Secrets. All
 // replicas share one ServiceAccount, so the RBAC cannot tell replica 0
 // from the others: only tailscaled's read-only mode keeps the others from
-// writing. No list permission is given, since it could not be limited to
-// these Secrets.
+// writing. List is only given with the "list" reload, since it cannot be
+// limited to these Secrets.
 func (s *Spec) Role() *rbacv1.Role {
 	names := make([]string, 0, int(s.Params.Replicas)+len(s.CertDomains))
 	for i := 0; i < int(s.Params.Replicas); i++ {
@@ -147,13 +151,14 @@ func (s *Spec) Role() *rbacv1.Role {
 	if s.Params.CertificateSharing {
 		names = append(names, s.CertDomains...)
 	}
-	return &rbacv1.Role{
-		ObjectMeta: s.meta(s.Gateway),
-		Rules: []rbacv1.PolicyRule{
-			{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: names, Verbs: []string{"get", "update", "patch"}},
-			{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},
-		},
+	rules := []rbacv1.PolicyRule{
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, ResourceNames: names, Verbs: []string{"get", "update", "patch"}},
+		{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},
 	}
+	if s.ListSecrets() {
+		rules = append(rules, rbacv1.PolicyRule{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"list"}})
+	}
+	return &rbacv1.Role{ObjectMeta: s.meta(s.Gateway), Rules: rules}
 }
 
 // RoleBinding binds Role to ServiceAccount.
@@ -315,15 +320,11 @@ func (s *Spec) StatefulSet() *appsv1.StatefulSet {
 		// could advertise again while the preStop hook drains.
 		{Name: "TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT", Value: "false"},
 	}
-	var podAnnotations map[string]string
 	if s.Params.CertificateSharing {
 		// The image's entrypoint makes the pod whose name ends in "-0"
 		// the only one that issues and renews certificates ("rw"); the
 		// others only read them ("ro").
 		env = append(env, corev1.EnvVar{Name: "TS_EXPERIMENTAL_CERT_SHARE", Value: "true"})
-		if s.CertHash != "" {
-			podAnnotations = map[string]string{AnnotationCertificates: s.CertHash}
-		}
 	}
 	selector := &metav1.LabelSelector{MatchLabels: SelectorLabels(s.Gateway)}
 	return &appsv1.StatefulSet{
@@ -333,7 +334,7 @@ func (s *Spec) StatefulSet() *appsv1.StatefulSet {
 			Selector:            selector,
 			PodManagementPolicy: appsv1.ParallelPodManagement,
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: podLabels, Annotations: podAnnotations},
+				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
 					ServiceAccountName: s.Gateway,
 					// Userspace networking needs no privileges, so the pods

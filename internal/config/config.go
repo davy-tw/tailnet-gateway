@@ -76,7 +76,23 @@ type ClassParams struct {
 	// which the other replicas read. Off by default: it relies on
 	// Tailscale's experimental cert share mode.
 	CertificateSharing bool
+	// CertificateReload is how the replicas that only read certificates
+	// pick up a renewed one: CertificateReloadRestart or
+	// CertificateReloadList.
+	CertificateReload string
 }
+
+// CertificateReload values.
+const (
+	// CertificateReloadRestart restarts the reading replicas shortly before
+	// the certificate they hold expires. The proxies can only read their
+	// own certificate Secrets.
+	CertificateReloadRestart = "restart"
+	// CertificateReloadList lets tailscaled list the Secrets of the
+	// Gateway's namespace, so that it reloads renewed certificates itself
+	// (daily). The proxies can then read every Secret in that namespace.
+	CertificateReloadList = "list"
+)
 
 // Config is the controller-wide configuration.
 type Config struct {
@@ -122,6 +138,7 @@ const (
 	EnvDrainGracePeriod    = "PROXY_DRAIN_GRACE_PERIOD"
 	EnvImage               = "PROXY_IMAGE"
 	EnvCertificateSharing  = "PROXY_CERTIFICATE_SHARING"
+	EnvCertificateReload   = "PROXY_CERTIFICATE_RELOAD"
 	EnvAuthKeyDescription  = "AUTH_KEY_DESCRIPTION"
 	EnvMetricsAddr         = "METRICS_BIND_ADDRESS"
 	EnvProbeAddr           = "HEALTH_PROBE_BIND_ADDRESS"
@@ -157,9 +174,10 @@ func Load(getenv func(string) string) (*Config, error) {
 		Namespace:           get(EnvNamespace, ""),
 	}
 	base := ClassParams{
-		Replicas:         2,
-		Image:            DefaultProxyImage,
-		DrainGracePeriod: 30 * time.Second,
+		Replicas:          2,
+		Image:             DefaultProxyImage,
+		DrainGracePeriod:  30 * time.Second,
+		CertificateReload: CertificateReloadRestart,
 	}
 	defaults, _, err := ParseClassParams(map[string]string{
 		ParamTags:               getenv(EnvTags),
@@ -167,6 +185,7 @@ func Load(getenv func(string) string) (*Config, error) {
 		ParamImage:              getenv(EnvImage),
 		ParamDrainGracePeriod:   getenv(EnvDrainGracePeriod),
 		ParamCertificateSharing: getenv(EnvCertificateSharing),
+		ParamCertificateReload:  getenv(EnvCertificateReload),
 	}, base)
 	if err != nil {
 		return nil, fmt.Errorf("controller defaults: %w", err)
@@ -185,6 +204,7 @@ const (
 	ParamImage              = "image"
 	ParamDrainGracePeriod   = "drainGracePeriod"
 	ParamCertificateSharing = "certificateSharing"
+	ParamCertificateReload  = "certificateReload"
 )
 
 // ParseClassParams overlays data on defaults. Empty values fall back to
@@ -241,6 +261,14 @@ func ParseClassParams(data map[string]string, defaults ClassParams) (ClassParams
 				return p, nil, fmt.Errorf("%s: %q is not a boolean", ParamCertificateSharing, v)
 			}
 			p.CertificateSharing = b
+		case ParamCertificateReload:
+			if v == "" {
+				continue
+			}
+			if v != CertificateReloadRestart && v != CertificateReloadList {
+				return p, nil, fmt.Errorf("%s: %q is not %q or %q", ParamCertificateReload, v, CertificateReloadRestart, CertificateReloadList)
+			}
+			p.CertificateReload = v
 		default:
 			unknown = append(unknown, k)
 		}

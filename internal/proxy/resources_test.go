@@ -116,15 +116,21 @@ func TestCertificateSharing(t *testing.T) {
 			}
 		}
 	}
-	if a := on.StatefulSet().Spec.Template.Annotations; a[AnnotationCertificates] != "" {
-		t.Errorf("annotations without a renewal = %v", a)
+	if len(on.Role().Rules) != 2 {
+		t.Errorf("rules with the restart reload = %+v", on.Role().Rules)
 	}
-	on.CertHash = "abc"
-	if a := on.StatefulSet().Spec.Template.Annotations; a[AnnotationCertificates] != "abc" {
-		t.Errorf("annotations = %v", a)
+	list := spec(2)
+	list.Params.CertificateSharing = true
+	list.Params.CertificateReload = config.CertificateReloadList
+	if rules := list.Role().Rules; len(rules) != 3 || rules[2].Verbs[0] != "list" || len(rules[2].ResourceNames) != 0 || rules[2].Resources[0] != "secrets" {
+		t.Errorf("rules with the list reload = %+v", rules)
+	}
+	off.Params.CertificateReload = config.CertificateReloadList // ignored while off
+	if len(off.Role().Rules) != 2 {
+		t.Errorf("list granted while sharing is off")
 	}
 
-	sec := on.CertSecret("web.tail1234.ts.net", "sum")
+	sec := on.CertSecret("web.tail1234.ts.net", map[string]string{AnnotationCertificateSHA256: "sum"})
 	if sec.Name != "web.tail1234.ts.net" || sec.Namespace != "ns" || len(sec.Data) != 0 {
 		t.Errorf("cert Secret = %+v", sec.ObjectMeta)
 	}
@@ -134,7 +140,7 @@ func TestCertificateSharing(t *testing.T) {
 			t.Errorf("label %s = %q, want %q", k, sec.Labels[k], v)
 		}
 	}
-	if sec.Annotations[AnnotationIssuedCertificate] != "sum" {
+	if sec.Annotations[AnnotationCertificateSHA256] != "sum" {
 		t.Errorf("annotations = %v", sec.Annotations)
 	}
 }

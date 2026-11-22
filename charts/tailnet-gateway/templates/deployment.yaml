@@ -12,6 +12,7 @@
   "PROXY_IMAGE" .Values.proxy.image
   "PROXY_DRAIN_GRACE_PERIOD" .Values.proxy.drainGracePeriod
   "PROXY_CERTIFICATE_SHARING" (toString .Values.proxy.certificateSharing)
+  "PROXY_CERTIFICATE_RELOAD" .Values.proxy.certificateReload
 -}}
 apiVersion: apps/v1
 kind: Deployment

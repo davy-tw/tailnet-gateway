@@ -91,7 +91,8 @@ the Tailscale API rejects key creation, its error is shown on the Gateway's
 A GatewayClass may set `spec.parametersRef` to a ConfigMap (group `""`, kind
 `ConfigMap`, with a namespace). No custom resource is needed. Recognized
 keys, each optional and falling back to the controller default: `tags`,
-`replicas`, `image`, `drainGracePeriod` and `certificateSharing` (see the
+`replicas`, `image`, `drainGracePeriod`, `certificateSharing` and
+`certificateReload` (see the
 README's "Certificate sharing").
 
 - Unknown keys are ignored with a warning.

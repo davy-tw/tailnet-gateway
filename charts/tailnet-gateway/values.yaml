@@ -58,6 +58,11 @@ proxy:
   # of every replica requesting its own. Uses Tailscale's experimental
   # cert share mode, so it is off by default.
   certificateSharing: ""
+  # How the other replicas load a renewed shared certificate: "restart"
+  # (default; they are restarted shortly before the previous one expires)
+  # or "list" (no restarts, but the proxies may read every Secret in the
+  # Gateway's namespace).
+  certificateReload: ""
 
 # Classes installed with the chart.
 gatewayClass:
