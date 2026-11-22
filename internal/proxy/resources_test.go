@@ -83,6 +83,69 @@ func TestRoleAndPDB(t *testing.T) {
 	}
 }
 
+func TestCertificateSharing(t *testing.T) {
+	envOf := func(s *Spec) map[string]string {
+		env := map[string]string{}
+		for _, e := range s.StatefulSet().Spec.Template.Spec.Containers[0].Env {
+			env[e.Name] = e.Value
+		}
+		return env
+	}
+	off := spec(2)
+	off.CertDomains = []string{"web.tail1234.ts.net"} // only CertGrants are granted
+	if _, ok := envOf(off)["TS_EXPERIMENTAL_CERT_SHARE"]; ok {
+		t.Error("cert share env set while off")
+	}
+	if got := strings.Join(off.Role().Rules[0].ResourceNames, ","); got != "gw-0,gw-1" {
+		t.Errorf("resourceNames while off = %s", got)
+	}
+
+	on := spec(2)
+	on.Params.CertificateSharing = true
+	on.CertDomains = []string{"web.tail1234.ts.net"}
+	on.CertGrants = on.CertDomains
+	if envOf(on)["TS_EXPERIMENTAL_CERT_SHARE"] != "true" {
+		t.Error("cert share env missing")
+	}
+	if got := strings.Join(on.Role().Rules[0].ResourceNames, ","); got != "gw-0,gw-1,web.tail1234.ts.net" {
+		t.Errorf("resourceNames = %s", got)
+	}
+	for _, r := range on.Role().Rules {
+		for _, v := range r.Verbs {
+			if v == "list" || v == "watch" || (v == "create" && r.Resources[0] == "secrets") {
+				t.Errorf("unexpected verb %s on %v", v, r.Resources)
+			}
+		}
+	}
+	if len(on.Role().Rules) != 2 {
+		t.Errorf("rules with the restart reload = %+v", on.Role().Rules)
+	}
+	list := spec(2)
+	list.Params.CertificateSharing = true
+	list.Params.CertificateReload = config.CertificateReloadList
+	if rules := list.Role().Rules; len(rules) != 3 || rules[2].Verbs[0] != "list" || len(rules[2].ResourceNames) != 0 || rules[2].Resources[0] != "secrets" {
+		t.Errorf("rules with the list reload = %+v", rules)
+	}
+	off.Params.CertificateReload = config.CertificateReloadList // ignored while off
+	if len(off.Role().Rules) != 2 {
+		t.Errorf("list granted while sharing is off")
+	}
+
+	sec := on.CertSecret("web.tail1234.ts.net", map[string]string{AnnotationCertificateSHA256: "sum"})
+	if sec.Name != "web.tail1234.ts.net" || sec.Namespace != "ns" || len(sec.Data) != 0 {
+		t.Errorf("cert Secret = %+v", sec.ObjectMeta)
+	}
+	for k, v := range map[string]string{LabelTailscaleSecretType: "certs", LabelTailscaleManaged: "true",
+		LabelTailscaleProxyGroup: "gw", LabelComponent: ComponentCertificate, LabelManagedBy: ManagedBy} {
+		if sec.Labels[k] != v {
+			t.Errorf("label %s = %q, want %q", k, sec.Labels[k], v)
+		}
+	}
+	if sec.Annotations[AnnotationCertificateSHA256] != "sum" {
+		t.Errorf("annotations = %v", sec.Annotations)
+	}
+}
+
 // fakeTailscale is a stand-in for the tailscale CLI that keeps its state
 // (running or not, the serve config it runs and the advertised Services) in
 // files under dir. "debug prefs" prints indented JSON, as the real CLI does.

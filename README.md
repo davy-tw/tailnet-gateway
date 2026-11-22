@@ -79,6 +79,8 @@ defaults that a GatewayClass can override.
 | `PROXY_REPLICAS` (per class) | `2` | Proxy pods per Gateway (1 to 64) |
 | `PROXY_IMAGE` (per class) | `tailscale/tailscale:v1.104.7` | Proxy image |
 | `PROXY_DRAIN_GRACE_PERIOD` (per class) | `30s` | Pod termination grace period, covering the drain |
+| `PROXY_CERTIFICATE_SHARING` (per class) | `false` | Only replica 0 issues TLS certificates and shares them (see [Certificate sharing](#certificate-sharing)) |
+| `PROXY_CERTIFICATE_RELOAD` (per class) | `restart` | How the other replicas load renewed certificates: `restart` or `list` |
 | `GATEWAY_CONTROLLER_NAME` | `tailnet-gateway.davy.tw/gateway-controller` | Every GatewayClass with this `controllerName` is served |
 | `DEFAULT_GATEWAY_CLASS` | `tailnet` | Class for Gateways generated from Ingresses and Services |
 | `INGRESS_CLASS` | `tailnet` | IngressClass served (also when it is the cluster default) |
@@ -91,13 +93,76 @@ defaults that a GatewayClass can override.
 ### Per-class parameters
 
 A GatewayClass may point `spec.parametersRef` at a ConfigMap (group `""`,
-kind `ConfigMap`, with a namespace) with any of `tags`, `replicas`, `image`
-and `drainGracePeriod`. Invalid values set `Accepted=False` with reason
+kind `ConfigMap`, with a namespace) with any of `tags`, `replicas`, `image`,
+`drainGracePeriod`, `certificateSharing` and `certificateReload`. Invalid values set `Accepted=False` with reason
 `InvalidParameters` on the class, and its Gateways stop serving until the
 class is valid again. See
 `examples/classes.yaml`. Tags are under the class owner's control: Gateways
 cannot override them. An empty value keeps the controller default, so a
 class cannot clear `PROXY_TAGS`.
+
+### Certificate sharing
+
+By default every proxy replica requests its own Let's Encrypt certificate
+for each HTTPS or TLS-terminating hostname, and keeps it in its state
+Secret. With several replicas, and with Gateways or replicas that are
+removed and created again, that can reach Let's Encrypt's limit of five
+certificates for the same name per week.
+
+With `certificateSharing: "true"` (or `PROXY_CERTIFICATE_SHARING=true`),
+the proxies run Tailscale's experimental cert share mode: replica 0 issues
+and renews the certificates, and the other replicas only read them. The
+controller creates one Secret per hostname in the Gateway's namespace,
+named after the hostname (`<name>.<tailnet>.ts.net`), and removes it after
+the hostname is gone. Their names cannot be chosen, and listener `certificateRefs`
+are still ignored.
+
+- The proxies get `get`, `update` and `patch` on these Secrets only. All
+  replicas share one ServiceAccount, so only tailscaled keeps replicas
+  other than 0 from writing.
+- The reading replicas keep a certificate in memory once loaded, and fail
+  TLS handshakes once it has expired: they never fetch a newer one on
+  their own. `certificateReload` (`PROXY_CERTIFICATE_RELOAD`) picks how
+  they get a renewed one:
+  - `restart` (default): the proxies get no `list`, which could not be
+    limited to these Secrets. After a renewal, the reading replicas that
+    started before it are restarted one at a time (with the usual drain)
+    when the replaced certificate has 7 days left. Tailscale renews with
+    about a third of the lifetime left (30 days for 90-day certificates),
+    so a replica restarted for another reason in between is not
+    restarted again. A certificate replaced with more than 45% of its
+    lifetime left (for example after a revocation), or a certificate
+    Secret deleted by hand, has them restarted at once. If it is renewed
+    again before they restart, the earlier deadline holds. Restarts wait
+    for all replicas to be ready (with a `CertificateReloadWaiting`
+    warning event) until the certificate they hold is about a day from
+    expiring (at once when its expiry is unknown, after a Secret deleted
+    by hand). Replica 0 reads the Secret every time and is never
+    restarted. Their logs show a harmless error about listing TLS Secrets
+    at startup and daily.
+  - `list`: the proxies may list the Secrets of the Gateway's namespace,
+    and tailscaled reloads renewed certificates itself, daily, without
+    restarts. They can then read every Secret in that namespace,
+    including other Gateways' state Secrets (with their node keys) and
+    auth key Secrets: use it only with one Gateway per namespace, and
+    nothing else secret in it.
+- A Secret whose hostname is no longer served stays granted for 5 minutes,
+  while replica 0's mounted serve config catches up (without access it
+  would request a certificate it cannot store, again and again). It is
+  then kept, without a grant, until every reading replica has started
+  since, as they may still hold its certificate.
+- While replica 0 is down, certificates are not renewed; the ones issued
+  keep working until they expire.
+- Replica 0 requests certificates for new hostnames when it starts and at
+  least hourly after (on port 443 at once). Until it has, the other
+  replicas fail those hostnames' TLS handshakes.
+- Turning it on fills each new shared Secret with the valid certificate a
+  replica already has that is valid longest, removes the per-replica
+  certificates from the state Secrets and rolls the pods. Reading replicas
+  never issue, so a hostname with no such certificate fails TLS on them
+  until replica 0 has issued one. Turning it off keeps the shared Secrets
+  until no pod runs in cert share mode (replica 0 rolls last), then
+  deletes them; every replica requests its own certificates again.
 
 ### Annotations
 

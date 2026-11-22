@@ -53,6 +53,17 @@ proxy:
   replicas: ""
   image: ""
   drainGracePeriod: ""
+  # "true" lets only replica 0 issue and renew TLS certificates and share
+  # them with the other replicas through one Secret per hostname, instead
+  # of every replica requesting its own. Uses Tailscale's experimental
+  # cert share mode, so it is off by default.
+  certificateSharing: ""
+  # How the other replicas load a renewed shared certificate: "restart"
+  # (default; they are restarted shortly before the previous one expires)
+  # or "list" (no restarts, but the proxies may read every Secret in the
+  # Gateway's namespace, including other Gateways' state: one Gateway per
+  # namespace only).
+  certificateReload: ""
 
 # Classes installed with the chart.
 gatewayClass:

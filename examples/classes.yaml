@@ -8,6 +8,8 @@ metadata:
 data:
   tags: tag:prod
   replicas: "3"
+  # Replica 0 issues the TLS certificates and shares them with the others.
+  certificateSharing: "true"
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
