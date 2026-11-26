@@ -24,6 +24,8 @@ tailnet client ──> svc:demo (demo.<tailnet>.ts.net)
 
 ## Requirements
 
+- Kubernetes 1.34 or newer (CI runs the end-to-end tests on kind and on
+  k3s 1.37)
 - Kubernetes with the Gateway API **v1.6.0 or newer, Standard channel** CRDs
   (only `v1` APIs are used; tested with v1.6 and v1.7)
 - Tailscale image **v1.86.0 or newer** for the proxies (default
@@ -34,13 +36,19 @@ tailnet client ──> svc:demo (demo.<tailnet>.ts.net)
 
 ```sh
 kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
-kubectl apply -f dist/install.yaml
+kubectl apply -f https://github.com/davy-tw/tailnet-gateway/releases/latest/download/install.yaml
 kubectl -n tailnet-gateway-system create secret generic tailnet-gateway \
   --from-literal=TAILSCALE_OAUTH_CLIENT_ID=... --from-literal=TAILSCALE_OAUTH_CLIENT_SECRET=...
 # The settings are read at start-up: restart after creating or changing them.
 kubectl -n tailnet-gateway-system rollout restart deployment/tailnet-gateway
-kubectl apply -f examples/demo.yaml
+kubectl apply -f https://raw.githubusercontent.com/davy-tw/tailnet-gateway/main/examples/demo.yaml
 ```
+
+`releases/latest` is the latest stable release. To install a given
+release, or a prerelease such as `v1.0.0-rc.1`, use
+`https://github.com/davy-tw/tailnet-gateway/releases/download/<tag>/install.yaml`.
+[`dist/install.yaml`](dist/install.yaml) in this repository holds the
+development manifests of `main`; it is not meant for installs.
 
 ### With Helm
 
@@ -52,9 +60,13 @@ kubectl create namespace tailnet-gateway-system
 kubectl -n tailnet-gateway-system create secret generic tailnet-gateway \
   --from-literal=TAILSCALE_OAUTH_CLIENT_ID=... --from-literal=TAILSCALE_OAUTH_CLIENT_SECRET=...
 helm install tailnet-gateway oci://ghcr.io/davy-tw/charts/tailnet-gateway \
-  --version <version> --namespace tailnet-gateway-system \
+  --namespace tailnet-gateway-system \
   --set oauth.existingSecret=tailnet-gateway --set proxy.tags=tag:k8s
 ```
+
+Without `--version`, Helm installs the latest stable release; pass
+`--version X.Y.Z` to pin one, or `--version X.Y.Z-rc.N` for a
+prerelease.
 
 Every setting in [Configuration](#configuration) has a value in
 [`charts/tailnet-gateway/values.yaml`](charts/tailnet-gateway/values.yaml). The
@@ -79,8 +91,8 @@ defaults that a GatewayClass can override.
 | `PROXY_REPLICAS` (per class) | `2` | Proxy pods per Gateway (1 to 64) |
 | `PROXY_IMAGE` (per class) | `tailscale/tailscale:v1.104.7` | Proxy image |
 | `PROXY_DRAIN_GRACE_PERIOD` (per class) | `30s` | Pod termination grace period, covering the drain |
-| `PROXY_CERTIFICATE_SHARING` (per class) | `false` | Only replica 0 issues TLS certificates and shares them (see [Certificate sharing](#certificate-sharing)) |
-| `PROXY_CERTIFICATE_RELOAD` (per class) | `restart` | How the other replicas load renewed certificates: `restart` or `list` |
+| `PROXY_CERTIFICATE_SHARING` (per class) | `false` | **Experimental.** Only replica 0 issues TLS certificates and shares them (see [Certificate sharing](#certificate-sharing)) |
+| `PROXY_CERTIFICATE_RELOAD` (per class) | `restart` | **Experimental.** How the other replicas load renewed certificates: `restart` or `list` |
 | `GATEWAY_CONTROLLER_NAME` | `tailnet-gateway.davy.tw/gateway-controller` | Every GatewayClass with this `controllerName` is served |
 | `DEFAULT_GATEWAY_CLASS` | `tailnet` | Class for Gateways generated from Ingresses and Services |
 | `INGRESS_CLASS` | `tailnet` | IngressClass served (also when it is the cluster default) |
@@ -102,6 +114,11 @@ cannot override them. An empty value keeps the controller default, so a
 class cannot clear `PROXY_TAGS`.
 
 ### Certificate sharing
+
+> **Experimental.** It relies on Tailscale's experimental cert share mode
+> (`TS_EXPERIMENTAL_CERT_SHARE`), so it is not covered by the
+> [compatibility promise](docs/compatibility.md) and may change in a minor
+> release.
 
 By default every proxy replica requests its own Let's Encrypt certificate
 for each HTTPS or TLS-terminating hostname, and keeps it in its state
@@ -255,18 +272,25 @@ GHCR:
   picks it when asked for that version);
 - every tag `vX.Y.Z`: image `:X.Y.Z`, `:X.Y` and `:latest` (amd64 and arm64),
   chart `oci://ghcr.io/davy-tw/charts/tailnet-gateway` version `X.Y.Z`, and a
-  GitHub release with the chart and an `install.yaml` pinned to that image.
+  GitHub release with the chart and an `install.yaml` pinned to that image;
+- every prerelease tag `vX.Y.Z-rc.N`: image `:X.Y.Z-rc.N` and chart
+  `X.Y.Z-rc.N` only, and a GitHub release marked as a prerelease. `latest`,
+  `X.Y` and the latest release stay on the last stable version.
 
-It can then deploy the release with `helm upgrade --install`. To turn that
-on, set the repository variable `DEPLOY_ENABLED=true` and add a `production`
-environment with a `KUBECONFIG` secret. The OAuth credentials stay in the
-cluster: create the Secret `tailnet-gateway` (or the one named by the
-variable `OAUTH_SECRET`) in the target namespace first. Optional variables:
-`DEPLOY_NAMESPACE` (default `tailnet-gateway-system`) and `HELM_VALUES` (a
-values file's contents). Running the workflow by hand with a version
-redeploys that version.
+Tags that are not `vX.Y.Z` or `vX.Y.Z-<prerelease>` publish nothing. To
+release:
 
-[`docs/design.md`](docs/design.md) describes the design and its decisions.
+1. Check the versions Dependabot does not update: the default proxy image
+   (`tailscale/tailscale`, `DefaultProxyImage` in `internal/config`, the README and the
+   CHANGELOG), and `KIND_VERSION`, `K3D_VERSION`, `K3S_IMAGE` and the Gateway
+   API versions in the workflows and the Makefile.
+2. For a stable release, date the version's section in
+   [`CHANGELOG.md`](CHANGELOG.md).
+3. Push the tag on a commit of `main`.
+
+[`docs/compatibility.md`](docs/compatibility.md) lists what stays stable
+across 1.x releases. [`docs/design.md`](docs/design.md) describes the design
+and its decisions.
 [`docs/spike-findings.md`](docs/spike-findings.md) records the prototype that validated direct proxying
 to cluster DNS names and gRPC through Tailscale Services.
 
