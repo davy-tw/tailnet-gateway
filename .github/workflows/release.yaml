@@ -4,18 +4,29 @@ name: release
 #
 # - Every push to main: image tags `main` and `sha-<short sha>`, and the
 #   chart as version 0.0.0-main.<short sha> pointing at that image.
-# - Every `v*` tag (for example v1.0.0): image tags `1.0.0`, `1.0` and
+# - Every release (for example 1.0.0): image tags `1.0.0`, `1.0` and
 #   `latest`; the chart as oci://ghcr.io/<owner>/charts/tailnet-gateway
 #   version 1.0.0; and a GitHub release with an install.yaml pinned to that
 #   image.
-# - A prerelease tag (for example v1.0.0-rc.1) publishes only image tag
+# - A prerelease (for example 1.0.0-rc.1) publishes only image tag
 #   `1.0.0-rc.1` and chart 1.0.0-rc.1, and its GitHub release is marked as a
 #   prerelease, so `latest`, `X.Y` and the latest release keep pointing at
 #   the last stable version.
+#
+# A release starts either by running this workflow by hand on main with the
+# version (Actions > release > Run workflow), which creates the tag
+# v<version> on that commit with the release once everything passed, or by
+# pushing a tag v<version>. The release is created with its assets in one
+# step, so this works with immutable releases.
 on:
   push:
     branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, without the v (for example 1.0.0 or 1.0.0-rc.1)
+        required: true
 permissions:
   contents: read
 concurrency:
@@ -26,27 +37,42 @@ env:
   CHART_REPO: oci://ghcr.io/${{ github.repository_owner }}/charts
 jobs:
   ci:
-    if: github.event_name == 'push'
     uses: ./.github/workflows/ci.yaml
 
   e2e:
-    if: github.event_name == 'push'
     uses: ./.github/workflows/e2e.yaml
 
-  # Rejects tags that are not semantic versions, so nothing is published
-  # for them (ci and e2e still run).
-  tag:
-    if: github.ref_type == 'tag'
+  # The release version: from the tag, or the input of a run by hand (only
+  # on main, and only for a tag that does not exist yet). Empty for pushes
+  # to main. Versions that are not semantic versions publish nothing (ci
+  # and e2e still run).
+  version:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - name: tag is vX.Y.Z or vX.Y.Z-<prerelease>
+      - id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT: ${{ inputs.version }}
         run: |
-          echo "$GITHUB_REF_NAME" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$' \
-            || { echo "tag $GITHUB_REF_NAME is not a semantic version (vX.Y.Z or vX.Y.Z-rc.N)"; exit 1; }
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            [ "$GITHUB_REF" = refs/heads/main ] || { echo "run it on main"; exit 1; }
+            version="${INPUT#v}"
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$version" >/dev/null 2>&1; then
+              echo "tag v$version already exists"; exit 1
+            fi
+          elif [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            exit 0
+          fi
+          echo "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$' \
+            || { echo "$version is not a semantic version (X.Y.Z or X.Y.Z-rc.N)"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   image:
-    if: github.event_name == 'push' && !failure() && !cancelled()
-    needs: [ci, e2e, tag]
+    needs: [ci, e2e, version]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -65,11 +91,11 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=ref,event=branch
+            type=ref,event=branch,enable=${{ github.event_name == 'push' }}
             type=sha
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+            type=semver,pattern={{version}},value=${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.version != '' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.version != '' }}
+            type=raw,value=latest,enable=${{ needs.version.outputs.version != '' && !contains(needs.version.outputs.version, '-') }}
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -81,8 +107,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   chart:
-    if: github.event_name == 'push'
-    needs: image
+    needs: [version, image]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -92,15 +117,17 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: v3.19.0
-      # A tag vX.Y.Z publishes chart X.Y.Z for image X.Y.Z. A push to main
+      # Release X.Y.Z publishes chart X.Y.Z for image X.Y.Z. A push to main
       # publishes chart 0.0.0-main.<short sha> for image sha-<short sha>
       # (a prerelease, so `helm install` without --version skips it).
       - name: version
         id: version
+        env:
+          RELEASE: ${{ needs.version.outputs.version }}
         run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-            echo "app=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          if [ -n "$RELEASE" ]; then
+            echo "version=$RELEASE" >> "$GITHUB_OUTPUT"
+            echo "app=$RELEASE" >> "$GITHUB_OUTPUT"
           else
             short="${GITHUB_SHA::7}"
             echo "version=0.0.0-main.${short}" >> "$GITHUB_OUTPUT"
@@ -115,19 +142,23 @@ jobs:
           helm package charts/tailnet-gateway --version "$VERSION" --app-version "$APP_VERSION" -d bin
           helm push "bin/tailnet-gateway-$VERSION.tgz" "$CHART_REPO"
       - name: install bundle pinned to the release image
-        if: github.ref_type == 'tag'
+        if: needs.version.outputs.version != ''
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           sed "s|image: ${IMAGE}:latest|image: ${IMAGE}:${VERSION}|" dist/install.yaml > bin/install.yaml
           grep -q "image: ${IMAGE}:${VERSION}" bin/install.yaml
+      # Creates the release with its assets in one call (gh uploads them to a
+      # draft and then publishes it), and with it the tag v<version> on this
+      # commit when the run was started by hand. A tag created with the
+      # workflow token does not start this workflow again.
       - name: GitHub release
-        if: github.ref_type == 'tag'
+        if: needs.version.outputs.version != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           args=()
           case "$VERSION" in *-*) args+=(--prerelease) ;; esac
-          gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag "${args[@]}" \
+          gh release create "v$VERSION" --target "$GITHUB_SHA" --generate-notes "${args[@]}" \
             "bin/install.yaml" "bin/tailnet-gateway-$VERSION.tgz"
