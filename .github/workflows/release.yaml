@@ -114,7 +114,7 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           version: v3.19.0
       # Release X.Y.Z publishes chart X.Y.Z for image X.Y.Z. A push to main
