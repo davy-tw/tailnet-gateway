@@ -53,7 +53,8 @@ proxy:
   replicas: ""
   image: ""
   drainGracePeriod: ""
-  # "true" lets only replica 0 issue and renew TLS certificates and share
+  # Experimental (not covered by the 1.x compatibility promise, see
+  # docs/compatibility.md): "true" lets only replica 0 issue and renew TLS certificates and share
   # them with the other replicas through one Secret per hostname, instead
   # of every replica requesting its own. Uses Tailscale's experimental
   # cert share mode, so it is off by default.
