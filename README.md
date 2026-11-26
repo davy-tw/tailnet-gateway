@@ -288,15 +288,6 @@ release:
    [`CHANGELOG.md`](CHANGELOG.md).
 3. Push the tag on a commit of `main`.
 
-It can then deploy the release with `helm upgrade --install`. To turn that
-on, set the repository variable `DEPLOY_ENABLED=true` and add a `production`
-environment with a `KUBECONFIG` secret. The OAuth credentials stay in the
-cluster: create the Secret `tailnet-gateway` (or the one named by the
-variable `OAUTH_SECRET`) in the target namespace first. Optional variables:
-`DEPLOY_NAMESPACE` (default `tailnet-gateway-system`) and `HELM_VALUES` (a
-values file's contents). Running the workflow by hand with a version
-redeploys that version.
-
 [`docs/compatibility.md`](docs/compatibility.md) lists what stays stable
 across 1.x releases. [`docs/design.md`](docs/design.md) describes the design
 and its decisions.

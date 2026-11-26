@@ -12,16 +12,10 @@ name: release
 #   `1.0.0-rc.1` and chart 1.0.0-rc.1, and its GitHub release is marked as a
 #   prerelease, so `latest`, `X.Y` and the latest release keep pointing at
 #   the last stable version.
-# - Optionally, a release is then deployed to a cluster (see the deploy job).
 on:
   push:
     branches: [main]
     tags: ["v*"]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Chart version to deploy (for example 1.0.0)
-        required: true
 permissions:
   contents: read
 concurrency:
@@ -137,48 +131,3 @@ jobs:
           case "$VERSION" in *-*) args+=(--prerelease) ;; esac
           gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag "${args[@]}" \
             "bin/install.yaml" "bin/tailnet-gateway-$VERSION.tgz"
-
-  # Deploys a released chart with `helm upgrade --install`. It runs only when
-  # the repository variable DEPLOY_ENABLED is "true", in the `production`
-  # environment, which must hold a KUBECONFIG secret (the kubeconfig file
-  # contents). The OAuth credentials are expected in the Secret named by the
-  # environment variable OAUTH_SECRET (default `tailnet-gateway`), created in
-  # the target namespace beforehand, so they never pass through Helm values.
-  deploy:
-    if: >-
-      vars.DEPLOY_ENABLED == 'true' &&
-      (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') &&
-      !failure() && !cancelled()
-    needs: [chart]
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
-        with:
-          version: v3.19.0
-      - name: kubeconfig
-        env:
-          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG }}
-        run: |
-          test -n "$KUBECONFIG_DATA" || { echo "the production environment has no KUBECONFIG secret"; exit 1; }
-          umask 077
-          printf '%s' "$KUBECONFIG_DATA" > "$RUNNER_TEMP/kubeconfig"
-          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
-      - name: helm upgrade --install
-        env:
-          VERSION: ${{ inputs.version || github.ref_name }}
-          NAMESPACE: ${{ vars.DEPLOY_NAMESPACE || 'tailnet-gateway-system' }}
-          OAUTH_SECRET: ${{ vars.OAUTH_SECRET || 'tailnet-gateway' }}
-          VALUES: ${{ vars.HELM_VALUES }}
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
-          args=()
-          if [ -n "$VALUES" ]; then printf '%s\n' "$VALUES" > "$RUNNER_TEMP/values.yaml"; args+=(-f "$RUNNER_TEMP/values.yaml"); fi
-          helm upgrade --install tailnet-gateway "$CHART_REPO/tailnet-gateway" \
-            --version "${VERSION#v}" --namespace "$NAMESPACE" --create-namespace \
-            --set oauth.existingSecret="$OAUTH_SECRET" "${args[@]}" \
-            --wait --timeout 5m
