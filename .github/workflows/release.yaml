@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Chart version to deploy (for example 0.1.0)
+        description: Chart version to deploy (for example 1.0.0)
         required: true
 permissions:
   contents: read
@@ -39,14 +39,15 @@ jobs:
     if: github.event_name == 'push'
     uses: ./.github/workflows/e2e.yaml
 
-  # Rejects tags that are not semantic versions before anything is built.
+  # Rejects tags that are not semantic versions, so nothing is published
+  # for them (ci and e2e still run).
   tag:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
       - name: tag is vX.Y.Z or vX.Y.Z-<prerelease>
         run: |
-          echo "$GITHUB_REF_NAME" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$' \
+          echo "$GITHUB_REF_NAME" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$' \
             || { echo "tag $GITHUB_REF_NAME is not a semantic version (vX.Y.Z or vX.Y.Z-rc.N)"; exit 1; }
 
   image:

@@ -44,10 +44,11 @@ kubectl -n tailnet-gateway-system rollout restart deployment/tailnet-gateway
 kubectl apply -f https://raw.githubusercontent.com/davy-tw/tailnet-gateway/main/examples/demo.yaml
 ```
 
-The install bundle of a given release is at
-`https://github.com/davy-tw/tailnet-gateway/releases/download/vX.Y.Z/install.yaml`;
-[`dist/install.yaml`](dist/install.yaml) in this repository follows `main`
-and uses the `latest` image.
+`releases/latest` is the latest stable release. To install a given
+release, or a prerelease such as `v1.0.0-rc.1`, use
+`https://github.com/davy-tw/tailnet-gateway/releases/download/<tag>/install.yaml`.
+[`dist/install.yaml`](dist/install.yaml) in this repository holds the
+development manifests of `main`; it is not meant for installs.
 
 ### With Helm
 
@@ -64,7 +65,8 @@ helm install tailnet-gateway oci://ghcr.io/davy-tw/charts/tailnet-gateway \
 ```
 
 Without `--version`, Helm installs the latest stable release; pass
-`--version X.Y.Z` to pin one.
+`--version X.Y.Z` to pin one, or `--version X.Y.Z-rc.N` for a
+prerelease.
 
 Every setting in [Configuration](#configuration) has a value in
 [`charts/tailnet-gateway/values.yaml`](charts/tailnet-gateway/values.yaml). The
@@ -275,9 +277,16 @@ GHCR:
   `X.Y.Z-rc.N` only, and a GitHub release marked as a prerelease. `latest`,
   `X.Y` and the latest release stay on the last stable version.
 
-Tags that are not `vX.Y.Z` or `vX.Y.Z-<prerelease>` fail before anything is
-built. To release, add the version's section to
-[`CHANGELOG.md`](CHANGELOG.md) and push a tag on a commit of `main`.
+Tags that are not `vX.Y.Z` or `vX.Y.Z-<prerelease>` publish nothing. To
+release:
+
+1. Check the versions Dependabot does not update: the default proxy image
+   (`tailscale/tailscale`, `DefaultProxyImage` in `internal/config`, the README and the
+   CHANGELOG), and `KIND_VERSION`, `K3D_VERSION`, `K3S_IMAGE` and the Gateway
+   API versions in the workflows and the Makefile.
+2. For a stable release, date the version's section in
+   [`CHANGELOG.md`](CHANGELOG.md).
+3. Push the tag on a commit of `main`.
 
 It can then deploy the release with `helm upgrade --install`. To turn that
 on, set the repository variable `DEPLOY_ENABLED=true` and add a `production`

@@ -11,6 +11,7 @@ Tailscale Services.
 
 ### Features
 
+- Runs on **Kubernetes 1.34** or newer.
 - **Gateway API** (v1.6 or newer, Standard channel, `v1` APIs only):
   Gateways of a managed GatewayClass with HTTP, HTTPS, TLS and TCP
   listeners; HTTPRoute (`PathPrefix`), GRPCRoute (on HTTPS listeners),

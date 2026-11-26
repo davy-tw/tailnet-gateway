@@ -20,7 +20,14 @@ on upgrade.
   `PROXY_IMAGE`, see below) and accepted values.
 - The GatewayClass `parametersRef` ConfigMap keys `tags`, `replicas`,
   `image` and `drainGracePeriod`.
-- The Helm chart's values, other than those of experimental features.
+- The Helm chart's values, other than `proxy.certificateSharing` and
+  `proxy.certificateReload` (experimental).
+- The key names in the controller's Secret (`oauth.existingSecret`, or
+  `tailnet-gateway` in the install bundle), which are loaded as environment
+  variables: `TAILSCALE_OAUTH_CLIENT_ID` and `TAILSCALE_OAUTH_CLIENT_SECRET`.
+- Manual key mode: for a Gateway `N`, the Secret `N` you create in its
+  namespace, with the auth key under `authkey`
+  ([example](../examples/manual-authkey.yaml)).
 
 **Class names**
 
@@ -67,7 +74,8 @@ so they are kept:
 
 - **Experimental features**, marked as such in the README: certificate
   sharing (`certificateSharing`, `certificateReload`, their environment
-  variables and chart values, and the certificate Secrets named after
+  variables, the chart values `proxy.certificateSharing` and
+  `proxy.certificateReload`, and the certificate Secrets named after
   hostnames). They may change or go away in a minor release.
 - **The default proxy image** (`PROXY_IMAGE`) is updated to newer Tailscale
   releases in minor and patch releases. Pin it per class to control when
