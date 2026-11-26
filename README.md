@@ -270,14 +270,14 @@ GHCR:
   `:sha-<commit>`, and chart `oci://ghcr.io/davy-tw/charts/tailnet-gateway`
   version `0.0.0-main.<commit>` using that image (a prerelease: Helm only
   picks it when asked for that version);
-- every tag `vX.Y.Z`: image `:X.Y.Z`, `:X.Y` and `:latest` (amd64 and arm64),
+- every release `X.Y.Z`: image `:X.Y.Z`, `:X.Y` and `:latest` (amd64 and arm64),
   chart `oci://ghcr.io/davy-tw/charts/tailnet-gateway` version `X.Y.Z`, and a
   GitHub release with the chart and an `install.yaml` pinned to that image;
-- every prerelease tag `vX.Y.Z-rc.N`: image `:X.Y.Z-rc.N` and chart
+- every prerelease `X.Y.Z-rc.N`: image `:X.Y.Z-rc.N` and chart
   `X.Y.Z-rc.N` only, and a GitHub release marked as a prerelease. `latest`,
   `X.Y` and the latest release stay on the last stable version.
 
-Tags that are not `vX.Y.Z` or `vX.Y.Z-<prerelease>` publish nothing. To
+Versions that are not `X.Y.Z` or `X.Y.Z-<prerelease>` publish nothing. To
 release:
 
 1. Check the versions Dependabot does not update: the default proxy image
@@ -286,7 +286,14 @@ release:
    API versions in the workflows and the Makefile.
 2. For a stable release, date the version's section in
    [`CHANGELOG.md`](CHANGELOG.md).
-3. Push the tag on a commit of `main`.
+3. Under Actions, open the `release` workflow, choose **Run workflow** on
+   `main` and enter the version without the `v` (for example
+   `1.0.0-rc.1`). It runs the tests on the head of `main`, publishes the
+   image and the chart, and then creates the tag `v<version>` and the
+   GitHub release with its assets at once, so nothing is left behind when
+   a test fails and it works with immutable releases. Pushing a tag
+   `v<version>` on a commit of `main` does the same. Do not create the
+   release on github.com yourself.
 
 [`docs/compatibility.md`](docs/compatibility.md) lists what stays stable
 across 1.x releases. [`docs/design.md`](docs/design.md) describes the design
