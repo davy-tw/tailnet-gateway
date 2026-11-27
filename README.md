@@ -283,7 +283,9 @@ release:
 1. Check the versions Dependabot does not update: the default proxy image
    (`tailscale/tailscale`, `DefaultProxyImage` in `internal/config`, the README and the
    CHANGELOG), and `KIND_VERSION`, `K3D_VERSION`, `K3S_IMAGE` and the Gateway
-   API versions in the workflows and the Makefile.
+   API versions in the workflows and the Makefile. The Go version is in
+   `.go-version` (read by CI), the `go` line of `go.mod` and the
+   Dockerfile's `golang` image: keep all three equal.
 2. For a stable release, date the version's section in
    [`CHANGELOG.md`](CHANGELOG.md).
 3. Under Actions, open the `release` workflow, choose **Run workflow** on
