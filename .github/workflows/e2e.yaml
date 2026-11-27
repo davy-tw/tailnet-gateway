@@ -34,7 +34,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: .go-version
       - uses: azure/setup-helm@v5
         with:
           version: v3.19.0
