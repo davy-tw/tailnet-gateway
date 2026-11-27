@@ -29,13 +29,13 @@ jobs:
       KIND_VERSION: v0.30.0
       K3D_VERSION: v5.9.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           version: v3.19.0
       - name: install kind
